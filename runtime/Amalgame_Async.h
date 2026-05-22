@@ -3,14 +3,16 @@
  * Copyright (c) 2026 Bastien MOUGET
  * https://github.com/amalgame-lang/Amalgame
  *
- * Cooperative concurrency: Fiber + Channel + Scheduler.
+ * Cooperative concurrency: Fiber + Channel + Scheduler + I/O.
  *
  * Stackful coroutines built on POSIX ucontext (Linux + macOS +
- * *BSD). Single-threaded round-robin scheduler. Composes with
+ * *BSD). Single-threaded round-robin scheduler with an epoll
+ * (Linux) integration so socket / pipe reads park the fiber
+ * instead of blocking the OS thread. Composes with
  * amalgame-threading for CPU parallelism (one scheduler per OS
  * thread; M:N is a v0.4 concern).
  *
- * v0.1 surface (single class `Async`, all methods static):
+ * v0.2 surface (single class `Async`, all methods static):
  *
  *   ── Fiber ──────────────────────────────────────────
  *   AmalgameFiber* FiberSpawn(closure, arg)
@@ -34,6 +36,27 @@
  *   void             SchedulerRunUntil(i64 ms)
  *   i64              SchedulerPending()
  *
+ *   ── I/O (v0.2, Linux only) ─────────────────────────
+ *   code_bool        WaitFdReadable(i64 fd, i64 timeout_ms)
+ *   code_bool        WaitFdWritable(i64 fd, i64 timeout_ms)
+ *   code_bool        MakeNonBlocking(i64 fd)
+ *
+ *      WaitFd* parks the current fiber until the kernel reports
+ *      the fd is ready (epoll EPOLLIN/EPOLLOUT) or until
+ *      timeout_ms milliseconds elapse. Negative timeout = wait
+ *      forever. Returns 1 on readiness, 0 on timeout or error.
+ *      MUST be called from inside a fiber; from main thread it
+ *      returns 0 immediately (use blocking syscalls there).
+ *      v0.2.0 supports one waiter per fd at a time — if two
+ *      fibers wait on the same fd concurrently, the second
+ *      overwrites the first registration and only one wakes.
+ *      Future: per-fd waiter lists, plus kqueue/IOCP backends.
+ *
+ *      MakeNonBlocking sets O_NONBLOCK on the fd via fcntl —
+ *      mandatory for the WaitFd dance to work correctly. Pair
+ *      `MakeNonBlocking(fd)` + a loop of `WaitFd*` + `read/write`
+ *      with EAGAIN handling.
+ *
  * GC integration: each fiber owns a GC_memalign'd stack block.
  * That keeps parked fibers' locals scannable (the stack memory
  * is itself a GC object, scanned conservatively by libgc as part
@@ -49,9 +72,13 @@
  * shared state through `Channel` (no Mutex needed; scheduler is
  * single-threaded so reads/writes between yields are atomic).
  *
- * Out of scope (v0.1):
- *   - epoll / kqueue / IOCP I/O integration (v0.2)
- *   - Windows Fibers backend (v0.2 — MinGW lacks ucontext)
+ * Out of scope (v0.2):
+ *   - kqueue (BSD + macOS) I/O backend (v0.2.1 — today's WaitFd
+ *     is Linux-only, emits a compile-time warning + returns 0
+ *     on other platforms)
+ *   - IOCP (Windows) I/O backend (v0.3, after the Windows
+ *     Fibers backend lands)
+ *   - Per-fd multi-fiber wait lists (one waiter per fd today)
  *   - Timer wheel for >1k concurrent sleepers (v0.3 — today
  *     the sleep list is sorted insertion in O(N))
  *   - `Async.Select` multi-channel readiness (v0.3)
@@ -72,6 +99,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <unistd.h>
+
+#ifdef __linux__
+# include <sys/epoll.h>
+# define AMASYNC_HAS_EPOLL 1
+#else
+# define AMASYNC_HAS_EPOLL 0
+#endif
 
 /* ─── bdwgc stack-bottom switching ────────────────────
  * `_runtime.h` pulls in <gc.h>, which declares struct
@@ -98,7 +135,10 @@ typedef struct AmalgameFiber {
     void*                 arg;
     i64                   id;
     int                   state;
-    i64                   wake_at_ms;   /* set when state == SLEEPING */
+    i64                   wake_at_ms;   /* set when SLEEPING or when fd-wait has a timeout */
+    int                   fd_waiting;       /* -1 if not waiting on an fd; otherwise the fd */
+    i64                   fd_deadline_ms;   /* -1 if no timeout; otherwise wake_at_ms copy */
+    int                   fd_wakeup_reason; /* set on wake — 1 = ready, 0 = timeout/error */
     struct AmalgameFiber* next;         /* queue link */
 } AmalgameFiber;
 
@@ -107,7 +147,10 @@ typedef struct AmalgameAsyncScheduler {
     AmalgameFiber* ready_tail;
     AmalgameFiber* sleeping;            /* sorted ascending wake_at_ms */
     AmalgameFiber* current;
-    i64            waiting_count;       /* fibers parked on channels */
+    i64            waiting_count;       /* fibers parked on channels OR fds */
+    i64            fd_waiters_count;    /* subset of waiting_count parked on fds */
+    int            epoll_fd;            /* epoll instance — see epoll_initialized */
+    int            epoll_initialized;   /* 0 until first WaitFd call */
     ucontext_t     main_ctx;
     struct GC_stack_base main_sb;
     int            main_sb_captured;
@@ -155,6 +198,18 @@ static inline void _amasync_sleep_insert(AmalgameFiber* f) {
     *cur = f;
 }
 
+static inline void _amasync_sleep_remove(AmalgameFiber* f) {
+    AmalgameFiber** cur = &_amasync_sched.sleeping;
+    while (*cur) {
+        if (*cur == f) {
+            *cur = f->next;
+            f->next = NULL;
+            return;
+        }
+        cur = &(*cur)->next;
+    }
+}
+
 static inline void _amasync_wake_due_sleepers(i64 now) {
     while (_amasync_sched.sleeping
             && _amasync_sched.sleeping->wake_at_ms <= now) {
@@ -162,6 +217,22 @@ static inline void _amasync_wake_due_sleepers(i64 now) {
         _amasync_sched.sleeping = f->next;
         f->next = NULL;
         f->state = AMASYNC_READY;
+        if (f->fd_waiting >= 0) {
+            /* Was a timed fd-wait — timeout fired before any event.
+             * Remove the fd from epoll so a later readiness event
+             * doesn't dispatch to a stale fiber pointer. */
+#if AMASYNC_HAS_EPOLL
+            if (_amasync_sched.epoll_initialized) {
+                epoll_ctl(_amasync_sched.epoll_fd, EPOLL_CTL_DEL,
+                          f->fd_waiting, NULL);
+            }
+#endif
+            f->fd_wakeup_reason = 0;  /* timeout */
+            f->fd_waiting = -1;
+            f->fd_deadline_ms = -1;
+            if (_amasync_sched.fd_waiters_count > 0) _amasync_sched.fd_waiters_count--;
+            if (_amasync_sched.waiting_count > 0)    _amasync_sched.waiting_count--;
+        }
         _amasync_ready_push(f);
     }
 }
@@ -236,6 +307,9 @@ static inline AmalgameFiber* Amalgame_Async_FiberSpawn(AmalgameClosure* fn, i64 
     f->id = ++_amasync_sched.next_id;
     f->state = AMASYNC_READY;
     f->wake_at_ms = 0;
+    f->fd_waiting = -1;
+    f->fd_deadline_ms = -1;
+    f->fd_wakeup_reason = 0;
     f->next = NULL;
 
     getcontext(&f->ctx);
@@ -288,6 +362,96 @@ static inline void Amalgame_Async_FiberSleep(i64 ms) {
 
 static inline i64 Amalgame_Async_FiberCurrentId(void) {
     return _amasync_sched.current ? _amasync_sched.current->id : 0;
+}
+
+/* ═══════════════════════════════════════════════════════
+ *  I/O — epoll (Linux) integration
+ * ═══════════════════════════════════════════════════════ */
+
+#if AMASYNC_HAS_EPOLL
+
+static inline void _amasync_init_epoll(void) {
+    if (_amasync_sched.epoll_initialized) return;
+    _amasync_sched.epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+    /* If epoll_create1 fails (very unlikely on Linux ≥ 2.6.27),
+     * leave epoll_fd at whatever -1 / error value epoll returned.
+     * Subsequent epoll_ctl calls will then fail and WaitFd will
+     * return 0 — degraded but not catastrophic. */
+    _amasync_sched.epoll_initialized = 1;
+}
+
+/* Common waiter for EPOLLIN / EPOLLOUT. Returns 1 on ready,
+ * 0 on timeout or error / not-in-fiber. */
+static inline code_bool _amasync_wait_fd(i64 fd, uint32_t events_mask, i64 timeout_ms) {
+    AmalgameFiber* f = _amasync_sched.current;
+    if (!f) return 0;  /* only meaningful inside a fiber */
+
+    _amasync_init_epoll();
+    if (_amasync_sched.epoll_fd < 0) return 0;
+
+    struct epoll_event ev;
+    ev.events = events_mask | EPOLLONESHOT;
+    ev.data.ptr = f;
+
+    if (epoll_ctl(_amasync_sched.epoll_fd, EPOLL_CTL_ADD, (int) fd, &ev) < 0) {
+        if (errno == EEXIST) {
+            /* fd was registered for a prior Wait — rearm via MOD */
+            if (epoll_ctl(_amasync_sched.epoll_fd, EPOLL_CTL_MOD, (int) fd, &ev) < 0) {
+                return 0;
+            }
+        } else {
+            return 0;
+        }
+    }
+
+    f->state = AMASYNC_WAITING;
+    f->fd_waiting = (int) fd;
+    f->fd_wakeup_reason = 0;
+    if (timeout_ms >= 0) {
+        f->fd_deadline_ms = _amasync_now_ms() + timeout_ms;
+        f->wake_at_ms = f->fd_deadline_ms;
+        _amasync_sleep_insert(f);
+    } else {
+        f->fd_deadline_ms = -1;
+    }
+    _amasync_sched.waiting_count++;
+    _amasync_sched.fd_waiters_count++;
+    _amasync_yield_to_main(f);
+
+    int reason = f->fd_wakeup_reason;
+    f->fd_waiting = -1;
+    f->fd_deadline_ms = -1;
+    f->fd_wakeup_reason = 0;
+    return reason > 0 ? 1 : 0;
+}
+
+static inline code_bool Amalgame_Async_WaitFdReadable(i64 fd, i64 timeout_ms) {
+    return _amasync_wait_fd(fd, EPOLLIN, timeout_ms);
+}
+
+static inline code_bool Amalgame_Async_WaitFdWritable(i64 fd, i64 timeout_ms) {
+    return _amasync_wait_fd(fd, EPOLLOUT, timeout_ms);
+}
+
+#else  /* !AMASYNC_HAS_EPOLL */
+# warning "amalgame-async v0.2: WaitFd* is Linux-only (epoll). kqueue/IOCP backends planned for v0.2.1+ — these calls return 0 on this platform."
+
+static inline code_bool Amalgame_Async_WaitFdReadable(i64 fd, i64 timeout_ms) {
+    (void) fd; (void) timeout_ms;
+    return 0;
+}
+static inline code_bool Amalgame_Async_WaitFdWritable(i64 fd, i64 timeout_ms) {
+    (void) fd; (void) timeout_ms;
+    return 0;
+}
+
+#endif /* AMASYNC_HAS_EPOLL */
+
+static inline code_bool Amalgame_Async_MakeNonBlocking(i64 fd) {
+    int flags = fcntl((int) fd, F_GETFL, 0);
+    if (flags < 0) return 0;
+    if (fcntl((int) fd, F_SETFL, flags | O_NONBLOCK) < 0) return 0;
+    return 1;
 }
 
 /* ═══════════════════════════════════════════════════════
@@ -435,23 +599,55 @@ static inline void _amasync_scheduler_pump(i64 deadline_ms) {
 
         AmalgameFiber* f = _amasync_ready_pop();
         if (!f) {
-            /* No runnable fibers. If sleepers exist, OS-sleep
-             * until the earliest wake_at (or the deadline). If
-             * nothing is sleeping and nothing is waiting on a
-             * channel, the scheduler is done. */
-            if (!_amasync_sched.sleeping) {
-                if (_amasync_sched.waiting_count == 0) break;
-                /* Channel-parked fibers with no possible wakeup
-                 * source = deadlock. Bail to avoid spinning. */
+            /* No runnable fibers. Three potential wakeup sources:
+             *   1. A sleeper's wake_at_ms passes  → time-driven
+             *   2. epoll signals a watched fd     → I/O-driven
+             *   3. The RunUntil deadline elapses  → caller's clock
+             * If none of {sleepers, fd-waiters} exist, only
+             * channel waiters remain — that's a deadlock; bail.
+             */
+            i64 next_wake = -1;
+            if (_amasync_sched.sleeping) next_wake = _amasync_sched.sleeping->wake_at_ms;
+            if (deadline_ms >= 0 && (next_wake < 0 || deadline_ms < next_wake)) {
+                next_wake = deadline_ms;
+            }
+            int has_fd_waiters = _amasync_sched.fd_waiters_count > 0;
+
+            if (next_wake < 0 && !has_fd_waiters) {
+                /* No time-driven wakeup. If channel waiters remain
+                 * (waiting_count > fd_waiters_count == 0), only
+                 * external pokes could unstick them — bail. */
                 break;
             }
-            i64 wake = _amasync_sched.sleeping->wake_at_ms;
-            if (deadline_ms >= 0 && deadline_ms < wake) wake = deadline_ms;
-            i64 dt = wake - now;
-            if (dt > 0) {
+
+            int timeout_ms = -1;
+            if (next_wake >= 0) {
+                i64 dt = next_wake - now;
+                timeout_ms = dt > 0 ? (int) dt : 0;
+            }
+
+#if AMASYNC_HAS_EPOLL
+            if (has_fd_waiters && _amasync_sched.epoll_initialized) {
+                struct epoll_event evs[16];
+                int n = epoll_wait(_amasync_sched.epoll_fd, evs, 16, timeout_ms);
+                for (int i = 0; i < n; i++) {
+                    AmalgameFiber* w = (AmalgameFiber*) evs[i].data.ptr;
+                    if (!w || w->state != AMASYNC_WAITING || w->fd_waiting < 0) continue;
+                    if (w->fd_deadline_ms >= 0) _amasync_sleep_remove(w);
+                    w->fd_wakeup_reason = 1;
+                    w->state = AMASYNC_READY;
+                    if (_amasync_sched.fd_waiters_count > 0) _amasync_sched.fd_waiters_count--;
+                    if (_amasync_sched.waiting_count > 0)    _amasync_sched.waiting_count--;
+                    _amasync_ready_push(w);
+                }
+                continue;
+            }
+#endif
+            /* No fd waiters — fall back to plain nanosleep. */
+            if (timeout_ms > 0) {
                 struct timespec ts;
-                ts.tv_sec  = (time_t) (dt / 1000);
-                ts.tv_nsec = (long)   ((dt % 1000) * 1000000L);
+                ts.tv_sec  = (time_t) (timeout_ms / 1000);
+                ts.tv_nsec = (long)   ((timeout_ms % 1000) * 1000000L);
                 nanosleep(&ts, NULL);
             }
             continue;

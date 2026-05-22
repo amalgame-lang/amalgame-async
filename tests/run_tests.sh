@@ -149,6 +149,11 @@ run_test "RunUntil deadline + Pending count"     "[PASS] RunUntil deadline + Pen
 run_test "FiberCurrentId distinct + 0 outside"   "[PASS] FiberCurrentId distinct + 0 outside"
 run_test "channel drain-then-sentinel"           "[PASS] channel drain-then-sentinel after Close"
 
+echo "── Async I/O (v0.2 — Linux epoll) ──────────"
+run_test "MakeNonBlocking sets O_NONBLOCK"       "[PASS] MakeNonBlocking sets O_NONBLOCK"
+run_test "WaitFdReadable wakes on byte arrival"  "[PASS] WaitFdReadable wakes on byte arrival"
+run_test "WaitFdReadable timeout returns false"  "[PASS] WaitFdReadable timeout returns false"
+
 echo ""
 echo "────────────────────────────────────────────"
 echo -e "  ${GREEN}PASS: $PASS${NC}  |  ${RED}FAIL: $FAIL${NC}  |  ${YELLOW}SKIP: $SKIP${NC}"

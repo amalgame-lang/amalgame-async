@@ -31,7 +31,15 @@ are part of POSIX libc. Linux glibc, macOS libSystem, FreeBSD
 API for new code in 10.6 but ABI-stable since — every modern
 coroutine library on macOS still uses it. Windows MSYS2 /
 MinGW does **not** ship ucontext; the Windows backend
-(Fibers API) is planned for v0.2.
+(Fibers API) is planned for v0.3.
+
+### epoll (Linux I/O multiplexing)
+
+`epoll_create1` / `epoll_ctl` / `epoll_wait` are Linux-kernel
+syscalls available since 2.6.27 (2008). Used for the v0.2 I/O
+backend to park fibers on socket / pipe readiness. The
+equivalent BSD/macOS `kqueue` backend is planned for v0.2.1,
+Windows `IOCP` for v0.3.
 
 ### libgc (Boehm garbage collector)
 
