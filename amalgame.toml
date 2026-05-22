@@ -1,0 +1,139 @@
+# Package manifest — amalgame-async
+#
+# Cooperative concurrency for Amalgame: Fiber, Channel, Scheduler.
+# Stackful coroutines built on POSIX ucontext (Linux/macOS) and
+# Windows Fibers (`ConvertThreadToFiber` / `SwitchToFiber`, v0.2).
+# Single-threaded round-robin scheduler — no preemption, no
+# OS threads. Designed to compose with `amalgame-threading` when
+# CPU parallelism is needed: spawn N OS threads, each running its
+# own Scheduler.Run() pumping its own fiber pool.
+#
+# Why a separate package from amalgame-threading:
+#   - Threading = preemptive OS threads (pthread, Mutex, Channel
+#     inter-thread). Async = cooperative scheduler over fibers
+#     sharing one OS thread.
+#   - Different mental models: locks vs. yields, kernel context
+#     switch vs. userland setcontext, parallelism vs. concurrency.
+#   - Mixing them in one package would force every Mutex consumer
+#     to embed a scheduler, and confuses `Fiber` vs `Thread`.
+#   - They compose cleanly *as orthogonal layers* (M:N scheduling
+#     is a v2+ concern, built by spawning one scheduler per
+#     thread).
+#
+# Surface (v0.1):
+#
+#   ── Fiber ──────────────────────────────────────────
+#   Fiber.Spawn(closure, arg)     queue a 1-arg closure as a new
+#                                 fiber; doesn't run until
+#                                 Scheduler.Run() pumps it
+#   Fiber.Yield()                 cooperative yield — current
+#                                 fiber moves to ready queue tail
+#   Fiber.Sleep(ms)               park current fiber until at
+#                                 least `ms` milliseconds have
+#                                 elapsed (scheduler advances
+#                                 other ready fibers meanwhile)
+#   Fiber.CurrentId()             integer id of the running fiber
+#                                 (0 = no scheduler / main)
+#
+#   ── Channel — bounded FIFO, scheduler-aware ────────
+#   Channel.New(capacity)
+#     ch.Send(value)              parks fiber if full
+#     ch.Receive() : i64          parks fiber if empty (0 if closed
+#                                  + empty — same sentinel
+#                                  convention as amalgame-threading)
+#     ch.TrySend(value) : bool
+#     ch.TryReceive() : i64
+#     ch.Close() / IsClosed()
+#     ch.Count() / Capacity()
+#
+#   ── Scheduler ──────────────────────────────────────
+#   Scheduler.Run()               pump fibers until the ready
+#                                 queue, the sleep queue, and the
+#                                 channel-wait queues are all
+#                                 empty. Returns when nothing
+#                                 remains to do.
+#   Scheduler.RunUntil(ms)        same, but aborts after `ms`
+#                                 milliseconds (returns even if
+#                                 fibers are still alive — they
+#                                 stay parked for the next call)
+#   Scheduler.Pending() : int     count of fibers still alive
+#                                 (ready + sleeping + parked)
+#
+# I/O integration: NOT in v0.1. `Fiber.Sleep`, `Channel.Send/Receive`,
+# `Fiber.Yield` are the only ways to give up control. v0.2 will add
+# `Async.ReadFd(fd)` / `Async.WriteFd(fd)` backed by `epoll` (Linux)
+# / `kqueue` (BSD/macOS) / `IOCP` (Windows), and amalgame-net-http
+# will gain a hook to register its sockets with the scheduler.
+#
+# bdwgc safety: each fiber owns a separately-allocated stack
+# (`GC_MALLOC_UNCOLLECTABLE` so the stack memory itself doesn't
+# get freed) and the scheduler calls `GC_set_stackbottom` /
+# `GC_get_stackbottom` at every switch so the collector scans the
+# CURRENTLY EXECUTING fiber's stack as a root. Parked fibers'
+# stacks are walked via `GC_add_roots` over the active stack range
+# only (the ucontext-saved `uc_stack` extent), so values held in
+# the suspended fiber's locals stay reachable.
+#
+# Closure model: same as amalgame-threading — `Fiber.Spawn` takes
+# a 1-arg `AmalgameClosure` (`(arg: int) => int`). Locals are
+# captured by value at creation time. Mutate shared state through
+# `Channel` (preferred) — no Mutex needed since the scheduler is
+# single-threaded.
+#
+# Out of scope (v0.2+):
+#   - Async I/O (epoll/kqueue/IOCP) — v0.2
+#   - amalgame-net-http fd registration hook — v0.2 (coordinated PR)
+#   - Native Windows Fibers — v0.2
+#   - Timer wheel for >1k concurrent timeouts (today: linear list) — v0.3
+#   - Async.Select multi-channel — v0.3
+#   - M:N scheduling (N threads × scheduler each) — v0.4
+#   - `async` / `await` language sugar in amc — separate amc work
+#
+# Installation:
+#
+#   amc package add async                                # via index
+#   amc package add github.com/amalgame-lang/amalgame-async@v0.1.0
+
+[package]
+name              = "amalgame-async"
+version           = "0.1.0"
+license           = "Apache-2.0"
+description       = "Cooperative concurrency for Amalgame — stackful coroutines, scheduler, channels. Single-threaded fiber pool on ucontext; composes with amalgame-threading for M:N parallelism."
+authors           = ["Bastien Mouget"]
+required-amalgame = ">=0.8.19"
+schema-version    = 1
+
+[stdlib]
+class     = "Async"
+header    = "runtime/Amalgame_Async.h"
+namespace = "Amalgame.Async"
+
+# No vendored sources — ucontext is in libc on every POSIX target.
+# Windows Fibers API (v0.2) is in kernel32. libgc is already linked
+# by the main Amalgame runtime.
+libs       = []
+
+[stdlib.functions]
+# Fiber
+FiberSpawn        = { returns = "AmalgameFiber*" }
+FiberYield        = { returns = "void" }
+FiberSleep        = { returns = "void" }
+FiberCurrentId    = { returns = "i64" }
+
+# Channel
+ChannelNew        = { returns = "AmalgameAsyncChannel*" }
+ChannelSend       = { returns = "code_bool" }
+ChannelReceive    = { returns = "i64" }
+ChannelTrySend    = { returns = "code_bool" }
+ChannelTryReceive = { returns = "i64" }
+ChannelClose      = { returns = "void" }
+ChannelIsClosed   = { returns = "code_bool" }
+ChannelCount      = { returns = "i64" }
+ChannelCapacity   = { returns = "i64" }
+
+# Scheduler
+SchedulerRun      = { returns = "void" }
+SchedulerRunUntil = { returns = "void" }
+SchedulerPending  = { returns = "i64" }
+
+[dependencies]

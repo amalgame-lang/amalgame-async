@@ -1,0 +1,202 @@
+// Stdlib test: Amalgame.Async — Fiber + Channel + Scheduler.
+// Self-contained, no external service. Exercises:
+//   - FiberSpawn + SchedulerRun pumps to completion
+//   - Yield round-robin ordering
+//   - Sleep ordering (earlier wake-time runs first)
+//   - Channel Send/Receive parks/wakes the right fiber
+//   - Channel Close drains + sentinels
+//   - SchedulerRunUntil deadline
+//   - SchedulerPending count
+
+namespace Tests
+
+import Amalgame.Async
+
+public class Counter {
+    public Value: int
+
+    public Counter(int v) {
+        this.Value = v
+    }
+}
+
+public class Program {
+    public static void Main(string[] args) {
+
+        // ── Spawn 3 fibers, each increments a shared counter ─
+        let c = new Counter(0)
+        let bump = (_x: int) => {
+            // single yield to demonstrate cooperative scheduling
+            c.Value = c.Value + 1
+            Async.FiberYield()
+            c.Value = c.Value + 10
+            return 0
+        }
+        Async.FiberSpawn(bump, 0)
+        Async.FiberSpawn(bump, 0)
+        Async.FiberSpawn(bump, 0)
+        Async.SchedulerRun()
+        // each fiber adds 1 then 10 — total 33
+        if (c.Value == 33) {
+            Console.WriteLine("[PASS] 3 fibers run to completion")
+        } else {
+            Console.WriteLine("[FAIL] counter = " + String_FromInt(c.Value))
+        }
+
+        // ── Round-robin yield ordering ───────────────────────
+        // Three fibers writing their id into a shared channel
+        // between yields. Order should be 1,2,3,1,2,3,...
+        let orderCh = Async.ChannelNew(32)
+        let stamp = (id: int) => {
+            var i: int = 0
+            while (i < 3) {
+                Async.ChannelSend(orderCh, id)
+                Async.FiberYield()
+                i = i + 1
+            }
+            return 0
+        }
+        Async.FiberSpawn(stamp, 1)
+        Async.FiberSpawn(stamp, 2)
+        Async.FiberSpawn(stamp, 3)
+        Async.SchedulerRun()
+        Async.ChannelClose(orderCh)
+        // Expect: 1, 2, 3, 1, 2, 3, 1, 2, 3
+        var seq: int = 0
+        var slot: int = 0
+        while (slot < 9) {
+            let v: int = Async.ChannelTryReceive(orderCh)
+            seq = seq * 10 + v
+            slot = slot + 1
+            if (seq > 999999999) { break }  // overflow guard
+        }
+        // 123123123
+        if (seq == 123123123) {
+            Console.WriteLine("[PASS] round-robin yield ordering")
+        } else {
+            Console.WriteLine("[FAIL] seq = " + String_FromInt(seq))
+        }
+
+        // ── Sleep ordering: earlier wake_at runs first ───────
+        let sleepCh = Async.ChannelNew(4)
+        let sleepy = (id: int) => {
+            // id 1 sleeps 40ms, id 2 sleeps 20ms, id 3 sleeps 80ms
+            if (id == 1) { Async.FiberSleep(40) }
+            if (id == 2) { Async.FiberSleep(20) }
+            if (id == 3) { Async.FiberSleep(80) }
+            Async.ChannelSend(sleepCh, id)
+            return 0
+        }
+        Async.FiberSpawn(sleepy, 1)
+        Async.FiberSpawn(sleepy, 2)
+        Async.FiberSpawn(sleepy, 3)
+        Async.SchedulerRun()
+        Async.ChannelClose(sleepCh)
+        let s1: int = Async.ChannelReceive(sleepCh)
+        let s2: int = Async.ChannelReceive(sleepCh)
+        let s3: int = Async.ChannelReceive(sleepCh)
+        // Expected order: 2 (20ms), 1 (40ms), 3 (80ms)
+        if (s1 == 2 && s2 == 1 && s3 == 3) {
+            Console.WriteLine("[PASS] sleep wake-time ordering")
+        } else {
+            Console.WriteLine("[FAIL] sleep order: " + String_FromInt(s1)
+                + "/" + String_FromInt(s2) + "/" + String_FromInt(s3))
+        }
+
+        // ── Channel parking: send blocks, recv unparks ───────
+        // Tiny capacity-1 channel. Producer wants to send 4
+        // values; consumer pulls them one at a time with yields
+        // in between, exercising the parking + waking path.
+        let smallCh = Async.ChannelNew(1)
+        let prodC = new Counter(0)
+        let producer = (_x: int) => {
+            var i: int = 0
+            while (i < 4) {
+                Async.ChannelSend(smallCh, 100 + i)
+                prodC.Value = prodC.Value + 1
+                i = i + 1
+            }
+            Async.ChannelClose(smallCh)
+            return 0
+        }
+        let consC = new Counter(0)
+        let consSum = new Counter(0)
+        let consumer = (_x: int) => {
+            while (true) {
+                let v: int = Async.ChannelReceive(smallCh)
+                if (v == 0 && Async.ChannelIsClosed(smallCh)) { break }
+                consSum.Value = consSum.Value + v
+                consC.Value = consC.Value + 1
+                Async.FiberYield()
+            }
+            return 0
+        }
+        Async.FiberSpawn(producer, 0)
+        Async.FiberSpawn(consumer, 0)
+        Async.SchedulerRun()
+        // values: 100 + 101 + 102 + 103 = 406
+        if (prodC.Value == 4 && consC.Value == 4 && consSum.Value == 406) {
+            Console.WriteLine("[PASS] channel parking producer-consumer")
+        } else {
+            Console.WriteLine("[FAIL] prod=" + String_FromInt(prodC.Value)
+                + " cons=" + String_FromInt(consC.Value)
+                + " sum=" + String_FromInt(consSum.Value))
+        }
+
+        // ── SchedulerRunUntil deadline ───────────────────────
+        // Spawn one fiber that sleeps 500ms. Run with a 30ms
+        // budget — fiber doesn't finish, but RunUntil returns.
+        let longSleep = (_x: int) => {
+            Async.FiberSleep(500)
+            return 0
+        }
+        Async.FiberSpawn(longSleep, 0)
+        Async.SchedulerRunUntil(30)
+        let pending: int = Async.SchedulerPending()
+        if (pending == 1) {
+            Console.WriteLine("[PASS] RunUntil deadline + Pending count")
+        } else {
+            Console.WriteLine("[FAIL] pending = " + String_FromInt(pending))
+        }
+        // Drain the leftover fiber so it doesn't interfere with
+        // subsequent tests' scheduler state.
+        Async.SchedulerRun()
+
+        // ── FiberCurrentId behaviour ─────────────────────────
+        let idsCh = Async.ChannelNew(4)
+        let recorder = (_x: int) => {
+            Async.ChannelSend(idsCh, Async.FiberCurrentId())
+            return 0
+        }
+        Async.FiberSpawn(recorder, 0)
+        Async.FiberSpawn(recorder, 0)
+        Async.SchedulerRun()
+        Async.ChannelClose(idsCh)
+        let id1: int = Async.ChannelReceive(idsCh)
+        let id2: int = Async.ChannelReceive(idsCh)
+        // Outside any fiber, CurrentId() should return 0
+        let idMain: int = Async.FiberCurrentId()
+        if (id1 > 0 && id2 > id1 && idMain == 0) {
+            Console.WriteLine("[PASS] FiberCurrentId distinct + 0 outside")
+        } else {
+            Console.WriteLine("[FAIL] ids id1=" + String_FromInt(id1)
+                + " id2=" + String_FromInt(id2)
+                + " main=" + String_FromInt(idMain))
+        }
+
+        // ── Channel: closed-and-empty Receive returns 0 ──────
+        let drainCh = Async.ChannelNew(2)
+        Async.ChannelSend(drainCh, 7)
+        Async.ChannelSend(drainCh, 8)
+        Async.ChannelClose(drainCh)
+        let d1: int = Async.ChannelReceive(drainCh)
+        let d2: int = Async.ChannelReceive(drainCh)
+        let d3: int = Async.ChannelReceive(drainCh)
+        if (d1 == 7 && d2 == 8 && d3 == 0 && Async.ChannelIsClosed(drainCh)) {
+            Console.WriteLine("[PASS] channel drain-then-sentinel after Close")
+        } else {
+            Console.WriteLine("[FAIL] drain " + String_FromInt(d1)
+                + "/" + String_FromInt(d2) + "/" + String_FromInt(d3))
+        }
+    }
+}

@@ -1,0 +1,11 @@
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.c.tmp
+gen_test.c
+gen_test
+.DS_Store
+.vscode/
+.idea/
