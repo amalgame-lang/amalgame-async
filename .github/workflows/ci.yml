@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test against amc ${{ matrix.amc-tag }}
+    runs-on: ubuntu-latest
+
+    # No service container — async primitives are self-contained.
+    # ucontext is libc on Ubuntu runners; libgc is apt-installable.
+
+    strategy:
+      fail-fast: false
+      matrix:
+        amc-tag: [v0.8.45]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps (libgc + libcurl)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libgc-dev libcurl4-openssl-dev
+
+      - name: Download amc ${{ matrix.amc-tag }}
+        run: |
+          set -e
+          TAG="${{ matrix.amc-tag }}"
+          VERSION="${TAG#v}"
+          curl -sSL -o amc.tar.gz \
+            "https://github.com/amalgame-lang/Amalgame/releases/download/${TAG}/amc-${VERSION}-linux-x86_64.tar.gz"
+          mkdir -p $RUNNER_TEMP/amc-install
+          tar -xzf amc.tar.gz -C $RUNNER_TEMP/amc-install --strip-components=1
+          echo "AMC=$RUNNER_TEMP/amc-install/bin/amc" >> $GITHUB_ENV
+          echo "AMC_RUNTIME=$RUNNER_TEMP/amc-install/share/amalgame/runtime" >> $GITHUB_ENV
+
+      - name: Probe libgc stack-bottom switching
+        run: |
+          cat > /tmp/gcprobe.c <<'EOF'
+          #include <gc.h>
+          int main(void) {
+              struct GC_stack_base sb;
+              GC_get_my_stackbottom(&sb);
+              GC_set_stackbottom((void*)0, &sb);
+              return 0;
+          }
+          EOF
+          if gcc /tmp/gcprobe.c -lgc -o /tmp/gcprobe 2>&1; then
+            echo "  GC_set_stackbottom: OK"
+          else
+            echo "  GC_set_stackbottom: MISSING — libgc too old (7.6+ required)"
+            exit 1
+          fi
+
+      - name: Run end-to-end tests
+        run: |
+          chmod +x ./tests/run_tests.sh
+          ./tests/run_tests.sh "$AMC"
