@@ -20,7 +20,7 @@
 #     is a v2+ concern, built by spawning one scheduler per
 #     thread).
 #
-# Surface (v0.1):
+# Surface (v0.2 — single class `Async`):
 #
 #   ── Fiber ──────────────────────────────────────────
 #   Fiber.Spawn(closure, arg)     queue a 1-arg closure as a new
@@ -48,10 +48,10 @@
 #
 #   ── Scheduler ──────────────────────────────────────
 #   Scheduler.Run()               pump fibers until the ready
-#                                 queue, the sleep queue, and the
-#                                 channel-wait queues are all
-#                                 empty. Returns when nothing
-#                                 remains to do.
+#                                 queue, the sleep queue, the
+#                                 channel-wait queues, and the
+#                                 fd-wait set are all empty.
+#                                 Returns when nothing remains.
 #   Scheduler.RunUntil(ms)        same, but aborts after `ms`
 #                                 milliseconds (returns even if
 #                                 fibers are still alive — they
@@ -59,11 +59,25 @@
 #   Scheduler.Pending() : int     count of fibers still alive
 #                                 (ready + sleeping + parked)
 #
-# I/O integration: NOT in v0.1. `Fiber.Sleep`, `Channel.Send/Receive`,
-# `Fiber.Yield` are the only ways to give up control. v0.2 will add
-# `Async.ReadFd(fd)` / `Async.WriteFd(fd)` backed by `epoll` (Linux)
-# / `kqueue` (BSD/macOS) / `IOCP` (Windows), and amalgame-net-http
-# will gain a hook to register its sockets with the scheduler.
+#   ── I/O (v0.2, Linux only) ────────────────────────
+#   Async.WaitFdReadable(fd, timeout_ms) : bool
+#                                 parks the current fiber until
+#                                 the kernel reports `fd` is
+#                                 readable, or until timeout_ms
+#                                 elapses. Negative timeout =
+#                                 forever. Returns true on ready,
+#                                 false on timeout/error.
+#   Async.WaitFdWritable(fd, timeout_ms) : bool
+#                                 same for writability.
+#   Async.MakeNonBlocking(fd) : bool
+#                                 sets O_NONBLOCK via fcntl —
+#                                 mandatory companion to WaitFd*.
+#
+# Backend coverage: Linux uses `epoll` (v0.2.0). `kqueue` (BSD +
+# macOS) is planned for v0.2.1; `IOCP` (Windows) for v0.3 once
+# the Fibers-API backend lands. On unsupported platforms the
+# WaitFd* calls emit a `#warning` and return 0 — the package
+# still builds, but no I/O parking is available.
 #
 # bdwgc safety: each fiber owns a separately-allocated stack
 # (`GC_MALLOC_UNCOLLECTABLE` so the stack memory itself doesn't
@@ -80,23 +94,26 @@
 # `Channel` (preferred) — no Mutex needed since the scheduler is
 # single-threaded.
 #
-# Out of scope (v0.2+):
-#   - Async I/O (epoll/kqueue/IOCP) — v0.2
-#   - amalgame-net-http fd registration hook — v0.2 (coordinated PR)
-#   - Native Windows Fibers — v0.2
+# Out of scope (v0.3+):
+#   - kqueue (BSD + macOS) I/O backend — v0.2.1
+#   - amalgame-net-http `Http1.ServeAsync` — coordinated PR
+#     once v0.2.0 is published
+#   - Native Windows Fibers backend (ucontext is POSIX) — v0.3
+#   - Windows IOCP I/O backend — v0.3
 #   - Timer wheel for >1k concurrent timeouts (today: linear list) — v0.3
 #   - Async.Select multi-channel — v0.3
+#   - Per-fd multi-fiber wait lists (today: one waiter per fd) — v0.3
 #   - M:N scheduling (N threads × scheduler each) — v0.4
 #   - `async` / `await` language sugar in amc — separate amc work
 #
 # Installation:
 #
 #   amc package add async                                # via index
-#   amc package add github.com/amalgame-lang/amalgame-async@v0.1.0
+#   amc package add github.com/amalgame-lang/amalgame-async@v0.2.0
 
 [package]
 name              = "amalgame-async"
-version           = "0.1.0"
+version           = "0.2.0"
 license           = "Apache-2.0"
 description       = "Cooperative concurrency for Amalgame — stackful coroutines, scheduler, channels. Single-threaded fiber pool on ucontext; composes with amalgame-threading for M:N parallelism."
 authors           = ["Bastien Mouget"]
@@ -135,5 +152,10 @@ ChannelCapacity   = { returns = "i64" }
 SchedulerRun      = { returns = "void" }
 SchedulerRunUntil = { returns = "void" }
 SchedulerPending  = { returns = "i64" }
+
+# I/O (v0.2, Linux epoll — kqueue/IOCP v0.2.1+)
+WaitFdReadable    = { returns = "code_bool" }
+WaitFdWritable    = { returns = "code_bool" }
+MakeNonBlocking   = { returns = "code_bool" }
 
 [dependencies]

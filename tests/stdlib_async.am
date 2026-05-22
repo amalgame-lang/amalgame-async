@@ -198,5 +198,108 @@ public class Program {
             Console.WriteLine("[FAIL] drain " + String_FromInt(d1)
                 + "/" + String_FromInt(d2) + "/" + String_FromInt(d3))
         }
+
+        // ═══════════════════════════════════════════════════════
+        // v0.2 — I/O parking via epoll
+        // ═══════════════════════════════════════════════════════
+
+        // ── Open a pipe via inline C (pipe(), close(), fcntl) ─
+        var rfd: int = -1
+        var wfd: int = -1
+        var pipeOk: int = 0
+        @c {
+            int _pfds[2];
+            if (pipe(_pfds) == 0) {
+                rfd = _pfds[0];
+                wfd = _pfds[1];
+                pipeOk = 1;
+            }
+        }
+
+        if (pipeOk != 1) {
+            Console.WriteLine("[FAIL] pipe() syscall failed")
+        } else {
+            // ── MakeNonBlocking flips O_NONBLOCK on an fd ────
+            let okNb: bool = Async.MakeNonBlocking(rfd)
+            var nbFlag: int = 0
+            @c {
+                int _fl = fcntl((int) rfd, F_GETFL, 0);
+                if (_fl >= 0 && (_fl & O_NONBLOCK)) nbFlag = 1;
+            }
+            if (okNb && nbFlag == 1) {
+                Console.WriteLine("[PASS] MakeNonBlocking sets O_NONBLOCK")
+            } else {
+                Console.WriteLine("[FAIL] MakeNonBlocking ok=" + String_FromInt(okNb)
+                    + " flag=" + String_FromInt(nbFlag))
+            }
+
+            // ── WaitFdReadable wakes when a byte arrives ─────
+            // Two fibers:
+            //   - reader: WaitFdReadable on pipe[0], then read 1 byte
+            //   - writer: brief Sleep, then write 1 byte to pipe[1]
+            // If epoll integration works, the reader fiber parks
+            // until the writer's byte arrives, then both finish.
+            let readBox = new Counter(0)
+            let readerReady = new Counter(0)
+            // The fd is passed via FiberSpawn's arg (not via
+            // closure capture) because @c {} blocks are opaque
+            // to the resolver — referencing wfd/rfd only in C
+            // code wouldn't add them to the closure's env.
+            let reader = (fd: int) => {
+                let ok: bool = Async.WaitFdReadable(fd, 2000)
+                if (ok) {
+                    readerReady.Value = 1
+                    var byteIn: int = -1
+                    @c {
+                        unsigned char _c = 0;
+                        ssize_t _n = read((int) fd, &_c, 1);
+                        byteIn = (_n > 0) ? (i64) _c : (i64) -1;
+                    }
+                    readBox.Value = byteIn
+                }
+                return 0
+            }
+            let writer = (fd: int) => {
+                Async.FiberSleep(20)
+                @c {
+                    unsigned char _c = 42;
+                    write((int) fd, &_c, 1);
+                }
+                return 0
+            }
+            Async.FiberSpawn(reader, rfd)
+            Async.FiberSpawn(writer, wfd)
+            Async.SchedulerRun()
+            if (readerReady.Value == 1 && readBox.Value == 42) {
+                Console.WriteLine("[PASS] WaitFdReadable wakes on byte arrival")
+            } else {
+                Console.WriteLine("[FAIL] WaitFdReadable ready="
+                    + String_FromInt(readerReady.Value)
+                    + " byte=" + String_FromInt(readBox.Value))
+            }
+
+            // ── WaitFdReadable timeout returns false ─────────
+            // Same fd, but no writer this time. Wait 50ms and
+            // assert the call returned without a byte.
+            let timeoutBox = new Counter(0)
+            let waiter = (fd: int) => {
+                let ok: bool = Async.WaitFdReadable(fd, 50)
+                if (!ok) { timeoutBox.Value = 1 }
+                return 0
+            }
+            Async.FiberSpawn(waiter, rfd)
+            Async.SchedulerRun()
+            if (timeoutBox.Value == 1) {
+                Console.WriteLine("[PASS] WaitFdReadable timeout returns false")
+            } else {
+                Console.WriteLine("[FAIL] WaitFdReadable timeout box="
+                    + String_FromInt(timeoutBox.Value))
+            }
+
+            @c {
+                close((int) rfd);
+                close((int) wfd);
+            }
+        }
     }
 }

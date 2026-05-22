@@ -1,9 +1,11 @@
 # amalgame-async
 
 Cooperative concurrency for [Amalgame](https://github.com/amalgame-lang/Amalgame).
-**Fiber**, **Channel**, **Scheduler** — stackful coroutines on
-POSIX `ucontext`, single-threaded round-robin scheduler. Pairs
-with [`amalgame-threading`](https://github.com/amalgame-lang/amalgame-threading)
+**Fiber**, **Channel**, **Scheduler** + **I/O** (epoll on Linux) —
+stackful coroutines on POSIX `ucontext`, single-threaded
+round-robin scheduler. Socket / pipe reads park the fiber instead
+of blocking the OS thread. Pairs with
+[`amalgame-threading`](https://github.com/amalgame-lang/amalgame-threading)
 for CPU parallelism (one scheduler per OS thread; M:N is a v0.4
 concern).
 
@@ -42,12 +44,12 @@ you've already got `amc` working.
 
 ```bash
 amc package add async                                # via index
-amc package add github.com/amalgame-lang/amalgame-async@v0.1.0
+amc package add github.com/amalgame-lang/amalgame-async@v0.2.0
 ```
 
 Requires **amc 0.8.19+**.
 
-## Surface (v0.1)
+## Surface (v0.2)
 
 ```amalgame
 import Amalgame.Async
@@ -86,7 +88,7 @@ public class Program {
 }
 ```
 
-### v0.1.0 method surface
+### v0.2.0 method surface
 
 | Method | Returns | Notes |
 |---|---|---|
@@ -106,9 +108,13 @@ public class Program {
 | `Async.ChannelCount(ch)` | `int` | Current buffered count |
 | `Async.ChannelCapacity(ch)` | `int` | Capacity passed at New time |
 | **Scheduler** | | |
-| `Async.SchedulerRun()` | `void` | Pump until ready + sleeping + waiting queues all empty |
+| `Async.SchedulerRun()` | `void` | Pump until ready + sleeping + waiting + fd-wait queues all empty |
 | `Async.SchedulerRunUntil(ms)` | `void` | Same, but stop after `ms` milliseconds |
 | `Async.SchedulerPending()` | `int` | Count of fibers still alive (ready + sleeping + waiting) |
+| **I/O — Linux only (v0.2.0)** | | |
+| `Async.WaitFdReadable(fd, timeout_ms)` | `bool` | Parks fiber until `fd` is readable. Negative timeout = wait forever. Returns `true` on ready, `false` on timeout/error. **Must be called from inside a fiber.** |
+| `Async.WaitFdWritable(fd, timeout_ms)` | `bool` | Same for writability |
+| `Async.MakeNonBlocking(fd)` | `bool` | Sets `O_NONBLOCK` via `fcntl` — mandatory companion to `WaitFd*` for the read/write loop pattern |
 
 ### Value erasure
 
@@ -181,22 +187,55 @@ thread), use `Threading.Channel` rather than
 and is safe across OS threads; `Async.Channel` assumes one
 thread + cooperative scheduling.
 
-## Deferred to v0.2+
+## I/O integration — read/write pattern
 
-- **Async I/O** (`epoll` Linux / `kqueue` BSD+macOS / `IOCP`
-  Windows). `Async.ReadFd(fd)` / `Async.WriteFd(fd)` that
-  park the fiber until the fd is ready. Coordinated PR in
-  `amalgame-net-http` to register sockets with the scheduler.
+For an async-friendly socket read, set `O_NONBLOCK` once, then
+loop: read until `EAGAIN`, then `WaitFdReadable`, then read again.
+
+```amalgame
+Async.MakeNonBlocking(connFd)
+Async.FiberSpawn((fd: int) => {
+    let ok: bool = Async.WaitFdReadable(fd, 30000)   // 30s
+    if (!ok) { return 0 }                            // timeout
+    // ... now read(fd, ...) won't block; if it returns -1 with
+    // errno=EAGAIN, loop back to WaitFdReadable
+    return 0
+}, connFd)
+```
+
+The next-version coordinated PR in `amalgame-net-http` will ship
+`Http1.ServeAsync(port, handler)` that does this dance internally
+— for v0.2 user code drives the loop manually.
+
+**Backend coverage:**
+
+| Platform | I/O backend | Status |
+|---|---|---|
+| Linux | `epoll` | ✅ v0.2.0 |
+| BSD + macOS | `kqueue` | 🟡 planned v0.2.1 |
+| Windows | `IOCP` (after Fibers backend) | 🟡 planned v0.3 |
+
+On unsupported platforms the package still builds and the
+fiber/channel/scheduler surface works; only `WaitFd*` is
+disabled (returns `false` with a compile-time `#warning`).
+
+## Deferred to v0.3+
+
+- **kqueue backend** (BSD + macOS) — v0.2.1
+- **Per-fd multi-fiber wait lists** — today only one fiber can
+  wait on a given fd at a time; a second `WaitFd*` on the same
+  fd overwrites the first
 - **Windows backend** (`ConvertThreadToFiber` / `SwitchToFiber`)
-  for MinGW. Today's `ucontext` path doesn't exist on Windows.
+  for MinGW + IOCP I/O. Today's `ucontext` path doesn't exist
+  on Windows
 - **Timer wheel** for >1k concurrent sleepers (v0.3). Today's
-  sorted-insertion sleep list is O(N) per `Sleep`.
-- **`Async.Select`** multi-channel readiness (v0.3).
+  sorted-insertion sleep list is O(N) per `Sleep`
+- **`Async.Select`** multi-channel + multi-fd readiness (v0.3)
 - **M:N scheduling** — one scheduler per OS thread, work
-  stealing, TLS for current scheduler (v0.4).
+  stealing, TLS for current scheduler (v0.4)
 - **`async` / `await`** language sugar in amc — a separate
-  language proposal, would desugar to `FiberSpawn` +
-  `ChannelReceive` patterns shown here.
+  language proposal, would desugar to `FiberSpawn` + WaitFd
+  patterns shown here
 
 ## Tests
 
@@ -204,10 +243,11 @@ thread + cooperative scheduling.
 ./tests/run_tests.sh /path/to/amc
 ```
 
-7 tests, all self-contained. Includes a multi-fiber
-producer-consumer that exercises channel parking + waking
-through a capacity-1 channel, and a sleep-ordering test that
-verifies the sleep queue's wake-time priority.
+10 tests, all self-contained — 7 covering fiber/channel/scheduler
+basics, 3 covering I/O parking (`MakeNonBlocking`,
+`WaitFdReadable` byte-arrival, `WaitFdReadable` timeout). The I/O
+tests use an inline `@c {}` block to open a `pipe()` and exercise
+the epoll integration end-to-end.
 
 ## Licence
 
