@@ -113,7 +113,7 @@
 
 [package]
 name              = "amalgame-async"
-version           = "0.2.2"
+version           = "0.2.3"
 license           = "Apache-2.0"
 description       = "Cooperative concurrency for Amalgame — stackful coroutines, scheduler, channels. Single-threaded fiber pool on ucontext; composes with amalgame-threading for M:N parallelism."
 authors           = ["Bastien Mouget"]
@@ -143,6 +143,11 @@ FiberCurrentId    = { returns = "i64" }
 # "wait for first of N" patterns.
 FiberCancel       = { returns = "void" }
 IsCancelled       = { returns = "code_bool" }
+# v0.2.3: ergonomic helper. Runs closure(arg) as a fresh fiber with
+# a ms budget; returns true if it finished before the deadline,
+# false if the deadline fired first (the worker fiber was
+# automatically FiberCancel'd).
+WithTimeout       = { returns = "code_bool" }
 
 # Channel
 ChannelNew        = { returns = "AmalgameAsyncChannel*" }
