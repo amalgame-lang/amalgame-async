@@ -158,7 +158,12 @@ typedef struct AmalgameAsyncScheduler {
     int            running;
 } AmalgameAsyncScheduler;
 
-static AmalgameAsyncScheduler _amasync_sched;
+/* v0.2.1: must NOT be `static` — when multiple translation units
+ * include this header (consumer + several packages), `static` gives
+ * each TU its own copy of the scheduler, breaking cross-TU fiber
+ * accounting. `weak` linkage tells the linker to merge them into
+ * one instance, header-only-friendly. */
+__attribute__((weak)) AmalgameAsyncScheduler _amasync_sched;
 
 /* ═══════════════════════════════════════════════════════
  *  Internal helpers
