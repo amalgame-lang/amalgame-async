@@ -219,6 +219,29 @@ On unsupported platforms the package still builds and the
 fiber/channel/scheduler surface works; only `WaitFd*` is
 disabled (returns `false` with a compile-time `#warning`).
 
+## v0.2.1 — cross-TU scheduler sharing fix (critical)
+
+Pre-v0.2.1 the scheduler global `_amasync_sched` was declared
+`static` inside the header. When more than one `.o` file in the
+final binary included `Amalgame_Async.h`, each `.o` got its own
+private copy of the scheduler. A fiber spawned in one TU (e.g. the
+HTTP server `nethttp.o`) was invisible to `FiberCurrentId()` called
+from another TU (e.g. the user app `demo.o`) — so any user handler
+dispatched through a framework layer (`amalgame-web`'s
+`WebApp.Handle`) ran with `FiberCurrentId() == 0` and `FiberSleep`
+silently fell back to `nanosleep`, blocking the OS thread and
+serialising the entire server.
+
+Fix: `__attribute__((weak)) AmalgameAsyncScheduler _amasync_sched`
+— the linker merges every TU's copy into one. Verified via a new
+regression test in `tests/run_tests.sh` that builds two object
+files which both include the header and asserts they observe the
+same `FiberCurrentId()`.
+
+**Upgrade strongly recommended** if you use `amalgame-async` with
+any package that depends on it transitively (notably
+`amalgame-net-http` v0.9.1+ and `amalgame-web` v0.12.0+).
+
 ## Deferred to v0.3+
 
 - **kqueue backend** (BSD + macOS) — v0.2.1

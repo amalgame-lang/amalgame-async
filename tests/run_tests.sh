@@ -154,10 +154,70 @@ run_test "MakeNonBlocking sets O_NONBLOCK"       "[PASS] MakeNonBlocking sets O_
 run_test "WaitFdReadable wakes on byte arrival"  "[PASS] WaitFdReadable wakes on byte arrival"
 run_test "WaitFdReadable timeout returns false"  "[PASS] WaitFdReadable timeout returns false"
 
+# v0.2.1 regression: scheduler globals must be SHARED across translation
+# units. Pre-v0.2.1 used `static` linkage on `_amasync_sched`, giving
+# every .o file its own copy — a fiber spawned in one TU was invisible
+# to FiberCurrentId() in another. Surfaced in production when
+# amalgame-web's WebApp.Handle (web facade.o) dispatched the user route
+# handler closure (lowered into the user app's demo.o): handler
+# observed FiberCurrentId() == 0 even though it ran from inside the
+# per-conn fiber that net-http's nethttp.o had spawned. Fixed by
+# `__attribute__((weak))` so the linker merges every TU's copy into one.
+echo "── Cross-TU scheduler sharing (regression) ──"
+printf "  %-46s" "fiber spawned in lib seen from app"
+if [ "$LIBGC_OK" = "0" ]; then
+    echo -e "${YELLOW}SKIP${NC} (libgc missing GC_set_stackbottom)"
+    SKIP=$((SKIP + 1))
+else
+    cat > "$BUILD_DIR/_xtu_lib.c" <<'CEOF'
+#include "Amalgame_Async.h"
+i64 xtu_lib_current_id(void) {
+    return Amalgame_Async_FiberCurrentId();
+}
+CEOF
+    cat > "$BUILD_DIR/_xtu_app.c" <<'CEOF'
+#include "Amalgame_Async.h"
+#include <stdio.h>
+extern i64 xtu_lib_current_id(void);
+static void* fiber_fn(void* env, void* arg) {
+    (void) env; (void) arg;
+    i64 app_id = Amalgame_Async_FiberCurrentId();
+    i64 lib_id = xtu_lib_current_id();
+    printf("app_id=%lld lib_id=%lld\n", (long long) app_id, (long long) lib_id);
+    return NULL;
+}
+int main(void) {
+    GC_INIT();
+    AmalgameClosure* c = AmalgameClosure_new((void*) fiber_fn, NULL);
+    Amalgame_Async_FiberSpawn(c, 0);
+    Amalgame_Async_SchedulerRun();
+    return 0;
+}
+CEOF
+    gcc -O2 -I"$AMC_RUNTIME" -I"$PKG_RUNTIME" -c "$BUILD_DIR/_xtu_lib.c" -o "$BUILD_DIR/_xtu_lib.o" 2>"$BUILD_DIR/_xtu.log"
+    gcc -O2 -I"$AMC_RUNTIME" -I"$PKG_RUNTIME" -c "$BUILD_DIR/_xtu_app.c" -o "$BUILD_DIR/_xtu_app.o" 2>>"$BUILD_DIR/_xtu.log"
+    gcc -O2 "$BUILD_DIR/_xtu_app.o" "$BUILD_DIR/_xtu_lib.o" -lgc -lm -lcurl -ldl -lpthread \
+        -o "$BUILD_DIR/_xtu" 2>>"$BUILD_DIR/_xtu.log"
+    if [ ! -x "$BUILD_DIR/_xtu" ]; then
+        echo -e "${RED}FAIL${NC} (build)"
+        head -5 "$BUILD_DIR/_xtu.log" | sed 's/^/    /'
+        FAIL=$((FAIL + 1))
+    else
+        XTU_OUT=$("$BUILD_DIR/_xtu")
+        # Expect app_id and lib_id equal AND positive. Bug behavior: lib_id==0.
+        AID=$(echo "$XTU_OUT" | sed -nE 's/.*app_id=([0-9]+).*/\1/p')
+        LID=$(echo "$XTU_OUT" | sed -nE 's/.*lib_id=([0-9]+).*/\1/p')
+        if [ -n "$AID" ] && [ "$AID" = "$LID" ] && [ "$AID" -gt 0 ] 2>/dev/null; then
+            echo -e "${GREEN}PASS${NC} ($XTU_OUT)"
+            PASS=$((PASS + 1))
+        else
+            echo -e "${RED}FAIL${NC} ($XTU_OUT — expected app_id == lib_id > 0)"
+            FAIL=$((FAIL + 1))
+        fi
+    fi
+fi
+
 echo ""
 echo "────────────────────────────────────────────"
 echo -e "  ${GREEN}PASS: $PASS${NC}  |  ${RED}FAIL: $FAIL${NC}  |  ${YELLOW}SKIP: $SKIP${NC}"
 echo "────────────────────────────────────────────"
-echo ""
-
-[ $FAIL -eq 0 ] && exit 0 || exit 1
