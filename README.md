@@ -219,6 +219,28 @@ On unsupported platforms the package still builds and the
 fiber/channel/scheduler surface works; only `WaitFd*` is
 disabled (returns `false` with a compile-time `#warning`).
 
+## v0.2.3 — `Async.WithTimeout` ergonomic helper
+
+```amalgame
+let done: bool = Async.WithTimeout(work, 0, 5000)   // 5s budget
+if (done) {
+    // work() completed
+} else {
+    // deadline fired — work's fiber was FiberCancel'd mid-flight
+}
+```
+
+Wraps the spawn + timer + cancel + channel-race dance into a single
+call. Two helper fibers race a 1-capacity channel: the worker runs
+the user closure and `TrySend(1)`; the timer `FiberSleep(ms)` then
+`TrySend(2)` + `FiberCancel(worker)`. The caller `ChannelReceive`s
+and returns the winner. Both fibers get cancelled at the end
+(idempotent if already done).
+
+**Composable.** Nest `WithTimeout` inside another `WithTimeout` —
+the outer's cancel propagates to the inner via `FiberCancel` and
+the inner worker observes it at its next yield point.
+
 ## v0.2.2 — cooperative cancellation
 
 `Async.FiberCancel(f)` flips a flag on the target fiber AND wakes it

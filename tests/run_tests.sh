@@ -159,6 +159,10 @@ run_test "FiberCancel wakes a sleeping fiber"    "[PASS] FiberCancel wakes a sle
 run_test "FiberCancel wakes channel-parked fbr"  "[PASS] FiberCancel wakes a channel-parked fiber"
 run_test "pre-cancelled fiber early-outs"        "[PASS] pre-cancelled fiber early-outs at every yield"
 
+echo "── WithTimeout (v0.2.3) ────────────────────"
+run_test "WithTimeout returns true when fast"    "[PASS] WithTimeout returns true when worker finishes early"
+run_test "WithTimeout returns false on deadline" "[PASS] WithTimeout returns false on deadline"
+
 # v0.2.1 regression: scheduler globals must be SHARED across translation
 # units. Pre-v0.2.1 used `static` linkage on `_amasync_sched`, giving
 # every .o file its own copy — a fiber spawned in one TU was invisible
