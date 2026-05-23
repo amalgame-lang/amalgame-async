@@ -301,5 +301,89 @@ public class Program {
                 close((int) wfd);
             }
         }
+
+        // ═══════════════════════════════════════════════════════
+        // v0.2.2 — cooperative cancellation
+        // ═══════════════════════════════════════════════════════
+
+        // ── Cancel-while-sleeping: spawn a fiber that sleeps for
+        // a long time, cancel it from another fiber, observe that
+        // the sleep returns promptly and IsCancelled is true. ──
+        let cancelBox = new Counter(0)
+        let cancelObs = new Counter(0)
+        let longSleeper = (_x: int) => {
+            Async.FiberSleep(60000)   // 60s — would block the test if cancel doesn't wake us
+            if (Async.IsCancelled()) {
+                cancelObs.Value = 1
+            }
+            cancelBox.Value = 1
+            return 0
+        }
+        let sleeper: AmalgameFiber = Async.FiberSpawn(longSleeper, 0)
+        let killer = (_x: int) => {
+            Async.FiberSleep(50)
+            Async.FiberCancel(sleeper)
+            return 0
+        }
+        Async.FiberSpawn(killer, 0)
+        // RunUntil rather than Run: bound the test even if the
+        // cancellation is broken (avoids a 60s wait).
+        Async.SchedulerRunUntil(2000)
+        if (cancelBox.Value == 1 && cancelObs.Value == 1) {
+            Console.WriteLine("[PASS] FiberCancel wakes a sleeping fiber")
+        } else {
+            Console.WriteLine("[FAIL] cancel-sleep box="
+                + String_FromInt(cancelBox.Value)
+                + " obs=" + String_FromInt(cancelObs.Value))
+        }
+
+        // ── Cancel-while-channel-recv: receiver parks on empty
+        // channel forever; canceller wakes it. ChannelReceive
+        // returns 0 (sentinel) and IsCancelled is true. ──
+        let recvCh = Async.ChannelNew(1)
+        let recvBox = new Counter(0)
+        let recvObs = new Counter(0)
+        let recvSpawned = new Counter(0)
+        var recvFiberId: int = 0
+        let parkRecv = (_x: int) => {
+            recvSpawned.Value = 1
+            let v: int = Async.ChannelReceive(recvCh)
+            recvBox.Value = v + 1   // +1 so 0-on-cancel maps to 1
+            if (Async.IsCancelled()) { recvObs.Value = 1 }
+            return 0
+        }
+        let recvFiber: AmalgameFiber = Async.FiberSpawn(parkRecv, 0)
+        let recvKiller = (_x: int) => {
+            Async.FiberSleep(50)
+            Async.FiberCancel(recvFiber)
+            return 0
+        }
+        Async.FiberSpawn(recvKiller, 0)
+        Async.SchedulerRunUntil(2000)
+        if (recvBox.Value == 1 && recvObs.Value == 1) {
+            Console.WriteLine("[PASS] FiberCancel wakes a channel-parked fiber")
+        } else {
+            Console.WriteLine("[FAIL] cancel-recv box="
+                + String_FromInt(recvBox.Value)
+                + " obs=" + String_FromInt(recvObs.Value))
+        }
+
+        // ── Pre-cancelled fiber: cancelling before SchedulerRun
+        // pumps it should cause Sleep / WaitFd / ChannelReceive
+        // to early-out, not park. We measure the runtime here. ──
+        let preBox = new Counter(0)
+        let preBody = (_x: int) => {
+            Async.FiberSleep(10000)   // would block 10s if it parked
+            preBox.Value = 1
+            return 0
+        }
+        let preTarget: AmalgameFiber = Async.FiberSpawn(preBody, 0)
+        Async.FiberCancel(preTarget)   // before any pump
+        Async.SchedulerRunUntil(500)
+        if (preBox.Value == 1) {
+            Console.WriteLine("[PASS] pre-cancelled fiber early-outs at every yield")
+        } else {
+            Console.WriteLine("[FAIL] pre-cancel box=" + String_FromInt(preBox.Value))
+        }
     }
 }

@@ -219,6 +219,40 @@ On unsupported platforms the package still builds and the
 fiber/channel/scheduler surface works; only `WaitFd*` is
 disabled (returns `false` with a compile-time `#warning`).
 
+## v0.2.2 — cooperative cancellation
+
+`Async.FiberCancel(f)` flips a flag on the target fiber AND wakes it
+if it's parked on a sleep, an `fd` wait, or a channel queue. The
+fiber observes the wake exactly like a normal resume — `FiberSleep`
+returns, `WaitFd*` returns `false`, `ChannelSend/Receive` return
+`false` / 0. Use `Async.IsCancelled()` at the yield point to detect
+the difference between a real event and a cancellation.
+
+```amalgame
+let worker: AmalgameFiber = Async.FiberSpawn(serveOneRequest, conn)
+// Cancel the worker if it's still alive 30s from now.
+Async.FiberSpawn((_x: int) => {
+    Async.FiberSleep(30000)
+    Async.FiberCancel(worker)
+    return 0
+}, 0)
+```
+
+Use cases:
+- **Graceful shutdown.** Track per-conn fibers in a set; on SIGTERM,
+  iterate and `FiberCancel` each one so in-flight handlers wake and
+  return promptly.
+- **Request timeouts.** Spawn the work + a timer fiber that cancels
+  the work if it overstays.
+- **Wait for first of N events.** Spawn N fiber waiters; cancel the
+  losers once the first one returns.
+
+Cooperative model — the cancelled fiber chooses when to return.
+Tight `while (!Async.IsCancelled())` loops finish promptly; opaque
+`AmalgameClosure_call1` to user code keeps running until it
+voluntarily hits a yield point. No preemption, no async-signal-safe
+juggling, no surprises.
+
 ## v0.2.1 — cross-TU scheduler sharing fix (critical)
 
 Pre-v0.2.1 the scheduler global `_amasync_sched` was declared

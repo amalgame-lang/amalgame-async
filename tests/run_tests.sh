@@ -154,6 +154,11 @@ run_test "MakeNonBlocking sets O_NONBLOCK"       "[PASS] MakeNonBlocking sets O_
 run_test "WaitFdReadable wakes on byte arrival"  "[PASS] WaitFdReadable wakes on byte arrival"
 run_test "WaitFdReadable timeout returns false"  "[PASS] WaitFdReadable timeout returns false"
 
+echo "── Cancellation (v0.2.2) ──────────────────"
+run_test "FiberCancel wakes a sleeping fiber"    "[PASS] FiberCancel wakes a sleeping fiber"
+run_test "FiberCancel wakes channel-parked fbr"  "[PASS] FiberCancel wakes a channel-parked fiber"
+run_test "pre-cancelled fiber early-outs"        "[PASS] pre-cancelled fiber early-outs at every yield"
+
 # v0.2.1 regression: scheduler globals must be SHARED across translation
 # units. Pre-v0.2.1 used `static` linkage on `_amasync_sched`, giving
 # every .o file its own copy — a fiber spawned in one TU was invisible

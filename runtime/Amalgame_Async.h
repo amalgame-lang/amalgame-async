@@ -139,6 +139,13 @@ typedef struct AmalgameFiber {
     int                   fd_waiting;       /* -1 if not waiting on an fd; otherwise the fd */
     i64                   fd_deadline_ms;   /* -1 if no timeout; otherwise wake_at_ms copy */
     int                   fd_wakeup_reason; /* set on wake — 1 = ready, 0 = timeout/error */
+    /* v0.2.2: cancellation.
+     *   `cancelled` flips to 1 when Async.FiberCancel(f) is called.
+     *   `chan_wait_head` points at the channel queue head that holds
+     *      this fiber (so cancellation can splice it out without
+     *      scanning every channel). NULL when not channel-waiting. */
+    int                   cancelled;
+    struct AmalgameFiber** chan_wait_head;
     struct AmalgameFiber* next;         /* queue link */
 } AmalgameFiber;
 
@@ -315,6 +322,8 @@ static inline AmalgameFiber* Amalgame_Async_FiberSpawn(AmalgameClosure* fn, i64 
     f->fd_waiting = -1;
     f->fd_deadline_ms = -1;
     f->fd_wakeup_reason = 0;
+    f->cancelled = 0;
+    f->chan_wait_head = NULL;
     f->next = NULL;
 
     getcontext(&f->ctx);
@@ -358,15 +367,106 @@ static inline void Amalgame_Async_FiberSleep(i64 ms) {
         nanosleep(&ts, NULL);
         return;
     }
+    if (f->cancelled) return;  /* v0.2.2: don't park if already cancelled */
     if (ms <= 0) ms = 0;
     f->state = AMASYNC_SLEEPING;
     f->wake_at_ms = _amasync_now_ms() + ms;
     _amasync_sleep_insert(f);
     _amasync_yield_to_main(f);
+    /* Resumed: cancelled fibers may have been woken early by
+     * Amalgame_Async_FiberCancel; that's an indistinguishable
+     * normal-wake from this side. Callers detect via IsCancelled. */
 }
 
 static inline i64 Amalgame_Async_FiberCurrentId(void) {
     return _amasync_sched.current ? _amasync_sched.current->id : 0;
+}
+
+/* ═══════════════════════════════════════════════════════
+ *  Cancellation (v0.2.2)
+ * ═══════════════════════════════════════════════════════
+ *
+ * Cooperative cancellation. `Async.FiberCancel(f)`:
+ *   - flips f->cancelled = 1
+ *   - if f is parked (sleep / fd-wait / channel-wait), splices it
+ *     out of that queue and pushes it to ready so it resumes
+ *     promptly at its next yield point
+ *
+ * The cancelled fiber observes the wake exactly like a normal
+ * resume — `Async.FiberSleep` returns, `WaitFd*` returns 0,
+ * `ChannelSend/Receive` return 0 / false. Callers detect cancel
+ * by calling `Async.IsCancelled()` at the yield point or by
+ * treating those sentinel returns as cancel hints.
+ *
+ * Typical user pattern:
+ *
+ *     while (!Async.IsCancelled()) {
+ *         let work: int = Async.ChannelReceive(queue)
+ *         if (Async.IsCancelled()) { break }     // recv woke us via cancel, not work
+ *         process(work)
+ *     }
+ *
+ * Use cases:
+ *   - In-flight graceful shutdown — cancel every per-connection
+ *     fiber when SIGTERM arrives.
+ *   - Request-scoped timeouts — spawn a worker fiber + a timer
+ *     fiber that cancels the worker if it overstays.
+ *   - "Wait for first of N events" — spawn N waiters, cancel the
+ *     losers once one returns.
+ */
+
+static inline void Amalgame_Async_FiberCancel(AmalgameFiber* f) {
+    if (!f || f->cancelled || f->state == AMASYNC_DEAD) return;
+    f->cancelled = 1;
+
+    /* Splice out of whatever queue f is parked on, set READY, push
+     * to the run queue. Order matters: epoll first (so the fd is
+     * cleaned before sleep_remove discards the deadline), sleep
+     * next, channel last. */
+    if (f->fd_waiting >= 0) {
+#if AMASYNC_HAS_EPOLL
+        if (_amasync_sched.epoll_initialized) {
+            epoll_ctl(_amasync_sched.epoll_fd, EPOLL_CTL_DEL,
+                      f->fd_waiting, NULL);
+        }
+#endif
+        if (f->fd_deadline_ms >= 0) _amasync_sleep_remove(f);
+        f->fd_waiting = -1;
+        f->fd_deadline_ms = -1;
+        f->fd_wakeup_reason = 0;  /* signals "not ready / cancelled" */
+        if (_amasync_sched.fd_waiters_count > 0) _amasync_sched.fd_waiters_count--;
+        if (_amasync_sched.waiting_count > 0)    _amasync_sched.waiting_count--;
+        f->state = AMASYNC_READY;
+        _amasync_ready_push(f);
+        return;
+    }
+    if (f->state == AMASYNC_SLEEPING) {
+        _amasync_sleep_remove(f);
+        f->state = AMASYNC_READY;
+        _amasync_ready_push(f);
+        return;
+    }
+    if (f->state == AMASYNC_WAITING && f->chan_wait_head) {
+        /* Walk the channel wait queue and splice f out. */
+        AmalgameFiber** cur = f->chan_wait_head;
+        while (*cur && *cur != f) cur = &(*cur)->next;
+        if (*cur == f) {
+            *cur = f->next;
+            f->next = NULL;
+        }
+        f->chan_wait_head = NULL;
+        if (_amasync_sched.waiting_count > 0) _amasync_sched.waiting_count--;
+        f->state = AMASYNC_READY;
+        _amasync_ready_push(f);
+        return;
+    }
+    /* AMASYNC_READY or AMASYNC_RUNNING: nothing to splice — the
+     * fiber will observe the flag at its next yield point. */
+}
+
+static inline code_bool Amalgame_Async_IsCancelled(void) {
+    return (_amasync_sched.current && _amasync_sched.current->cancelled)
+            ? 1 : 0;
 }
 
 /* ═══════════════════════════════════════════════════════
@@ -390,6 +490,7 @@ static inline void _amasync_init_epoll(void) {
 static inline code_bool _amasync_wait_fd(i64 fd, uint32_t events_mask, i64 timeout_ms) {
     AmalgameFiber* f = _amasync_sched.current;
     if (!f) return 0;  /* only meaningful inside a fiber */
+    if (f->cancelled) return 0;  /* v0.2.2: don't park if already cancelled */
 
     _amasync_init_epoll();
     if (_amasync_sched.epoll_fd < 0) return 0;
@@ -516,10 +617,14 @@ static inline code_bool Amalgame_Async_ChannelSend(AmalgameAsyncChannel* ch, i64
              * should use TrySend. */
             return 0;
         }
+        if (f->cancelled) return 0;  /* v0.2.2: respect prior cancel */
         f->state = AMASYNC_WAITING;
+        f->chan_wait_head = &ch->waiters_send;
         _amasync_queue_push(&ch->waiters_send, f);
         _amasync_sched.waiting_count++;
         _amasync_yield_to_main(f);
+        f->chan_wait_head = NULL;
+        if (f->cancelled) return 0;
         /* loop — re-check capacity on resume */
     }
 }
@@ -546,10 +651,14 @@ static inline i64 Amalgame_Async_ChannelReceive(AmalgameAsyncChannel* ch) {
         if (ch->closed) return 0;  /* drained + closed → sentinel */
         AmalgameFiber* f = _amasync_sched.current;
         if (!f) return 0;  /* outside a fiber + empty: don't block */
+        if (f->cancelled) return 0;  /* v0.2.2 */
         f->state = AMASYNC_WAITING;
+        f->chan_wait_head = &ch->waiters_recv;
         _amasync_queue_push(&ch->waiters_recv, f);
         _amasync_sched.waiting_count++;
         _amasync_yield_to_main(f);
+        f->chan_wait_head = NULL;
+        if (f->cancelled) return 0;
     }
 }
 
