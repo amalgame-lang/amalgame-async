@@ -693,6 +693,98 @@ static inline i64 Amalgame_Async_ChannelCapacity(AmalgameAsyncChannel* ch) {
 }
 
 /* ═══════════════════════════════════════════════════════
+ *  WithTimeout (v0.2.3)
+ * ═══════════════════════════════════════════════════════
+ *
+ * `Amalgame_Async_WithTimeout(closure, arg, ms)` runs `closure(arg)`
+ * as a fresh fiber with a `ms`-millisecond budget. Returns 1 if the
+ * closure finished before the deadline, 0 if the deadline fired
+ * first (in which case the closure's fiber was FiberCancel'd —
+ * it'll observe the wake at its next yield point and unwind).
+ *
+ * Two helper fibers race a 1-capacity Channel:
+ *   - worker fiber: runs the user closure, then TrySend(1) on win.
+ *   - timer fiber:  FiberSleep(ms), then TrySend(2) + FiberCancel
+ *                   the worker on win.
+ * The caller's fiber ChannelReceive's; whichever sender won decides
+ * the return value. Both fibers are then cancelled (no-op on the
+ * one that already finished). Idempotent.
+ *
+ * Composable: nest WithTimeout inside another WithTimeout — the
+ * outer's cancel propagates to the inner via FiberCancel (the inner
+ * worker observes IsCancelled at its next yield point).
+ */
+
+typedef struct {
+    AmalgameClosure*      _wt_inner_fn;
+    void*                 _wt_inner_arg;
+    AmalgameAsyncChannel* _wt_done_ch;
+} _amasync_wt_worker_env;
+
+typedef struct {
+    AmalgameFiber*        _wt_worker;
+    i64                   _wt_ms;
+    AmalgameAsyncChannel* _wt_done_ch;
+} _amasync_wt_timer_env;
+
+static void* _amasync_wt_worker_fn(void* envRaw, void* arg) {
+    (void) arg;
+    _amasync_wt_worker_env* e = (_amasync_wt_worker_env*) envRaw;
+    AmalgameClosure_call1(e->_wt_inner_fn, e->_wt_inner_arg);
+    /* TrySend: if the channel is already filled by the timer, we
+     * silently lose the race — that's the "timeout fired" outcome
+     * even though our closure happened to complete moments later. */
+    Amalgame_Async_ChannelTrySend(e->_wt_done_ch, 1);
+    return NULL;
+}
+
+static void* _amasync_wt_timer_fn(void* envRaw, void* arg) {
+    (void) arg;
+    _amasync_wt_timer_env* e = (_amasync_wt_timer_env*) envRaw;
+    Amalgame_Async_FiberSleep(e->_wt_ms);
+    if (Amalgame_Async_IsCancelled()) return NULL;
+    /* Try to claim the timeout slot. If the worker already won,
+     * TrySend fails and we don't cancel — the worker's value is
+     * already in flight to the caller. */
+    if (Amalgame_Async_ChannelTrySend(e->_wt_done_ch, 2)) {
+        Amalgame_Async_FiberCancel(e->_wt_worker);
+    }
+    return NULL;
+}
+
+static inline code_bool Amalgame_Async_WithTimeout(
+        AmalgameClosure* fn, i64 arg, i64 ms) {
+    if (!fn) return 0;
+    if (ms <= 0) return 0;  /* zero budget = instant timeout */
+
+    AmalgameAsyncChannel* done = Amalgame_Async_ChannelNew(1);
+
+    _amasync_wt_worker_env* we =
+        (_amasync_wt_worker_env*) GC_MALLOC(sizeof(_amasync_wt_worker_env));
+    we->_wt_inner_fn  = fn;
+    we->_wt_inner_arg = (void*) (intptr_t) arg;
+    we->_wt_done_ch   = done;
+    AmalgameClosure* worker_closure =
+        AmalgameClosure_new((void*) _amasync_wt_worker_fn, we);
+    AmalgameFiber* worker = Amalgame_Async_FiberSpawn(worker_closure, 0);
+
+    _amasync_wt_timer_env* te =
+        (_amasync_wt_timer_env*) GC_MALLOC(sizeof(_amasync_wt_timer_env));
+    te->_wt_worker  = worker;
+    te->_wt_ms      = ms;
+    te->_wt_done_ch = done;
+    AmalgameClosure* timer_closure =
+        AmalgameClosure_new((void*) _amasync_wt_timer_fn, te);
+    AmalgameFiber* timer = Amalgame_Async_FiberSpawn(timer_closure, 0);
+
+    i64 winner = Amalgame_Async_ChannelReceive(done);
+    /* Belt-and-braces: cancel the loser (idempotent if already done). */
+    Amalgame_Async_FiberCancel(worker);
+    Amalgame_Async_FiberCancel(timer);
+    return winner == 1 ? 1 : 0;
+}
+
+/* ═══════════════════════════════════════════════════════
  *  Scheduler
  * ═══════════════════════════════════════════════════════ */
 
