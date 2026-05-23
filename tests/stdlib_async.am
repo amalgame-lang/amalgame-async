@@ -385,5 +385,59 @@ public class Program {
         } else {
             Console.WriteLine("[FAIL] pre-cancel box=" + String_FromInt(preBox.Value))
         }
+
+        // ═══════════════════════════════════════════════════════
+        // v0.2.3 — WithTimeout
+        // ═══════════════════════════════════════════════════════
+
+        // Fast worker (50 ms) under a 1 s budget → returns true,
+        // body actually ran.
+        let fastBox = new Counter(0)
+        let fastBody = (_x: int) => {
+            Async.FiberSleep(50)
+            fastBox.Value = 42
+            return 0
+        }
+        // WithTimeout must itself be called from inside a fiber (it
+        // ChannelReceive's on its done channel). Wrap in a runner.
+        let fastResult = new Counter(-1)
+        let fastRunner = (_x: int) => {
+            let done: bool = Async.WithTimeout(fastBody, 0, 1000)
+            fastResult.Value = done ? 1 : 0
+            return 0
+        }
+        Async.FiberSpawn(fastRunner, 0)
+        Async.SchedulerRunUntil(3000)
+        if (fastResult.Value == 1 && fastBox.Value == 42) {
+            Console.WriteLine("[PASS] WithTimeout returns true when worker finishes early")
+        } else {
+            Console.WriteLine("[FAIL] WithTimeout fast: done="
+                + String_FromInt(fastResult.Value)
+                + " box=" + String_FromInt(fastBox.Value))
+        }
+
+        // Slow worker (5 s) under a 100 ms budget → returns false,
+        // worker gets cancelled mid-sleep, completion side-effect
+        // never observed by the caller.
+        let slowBox = new Counter(0)
+        let slowBody = (_x: int) => {
+            Async.FiberSleep(5000)
+            slowBox.Value = 99   // shouldn't observe this
+            return 0
+        }
+        let slowResult = new Counter(-1)
+        let slowRunner = (_x: int) => {
+            let done: bool = Async.WithTimeout(slowBody, 0, 100)
+            slowResult.Value = done ? 1 : 0
+            return 0
+        }
+        Async.FiberSpawn(slowRunner, 0)
+        Async.SchedulerRunUntil(2000)
+        if (slowResult.Value == 0) {
+            Console.WriteLine("[PASS] WithTimeout returns false on deadline")
+        } else {
+            Console.WriteLine("[FAIL] WithTimeout slow result="
+                + String_FromInt(slowResult.Value))
+        }
     }
 }
