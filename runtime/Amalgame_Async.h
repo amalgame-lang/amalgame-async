@@ -81,7 +81,13 @@
  *   - Per-fd multi-fiber wait lists (one waiter per fd today)
  *   - Timer wheel for >1k concurrent sleepers (v0.3 — today
  *     the sleep list is sorted insertion in O(N))
- *   - `Async.Select` multi-channel readiness (v0.3)
+ *
+ * Shipped since:
+ *   - v0.3.0: `Async.Select` multi-channel readiness —
+ *     SelectReceive / SelectTryReceive / SelectValue. A fiber
+ *     registers a waiter node on every channel at once (not the
+ *     naive "spawn N racers" hack), so no value is consumed-then-
+ *     discarded; round-robin start offset keeps it starvation-free.
  */
 
 #ifndef AMALGAME_ASYNC_H
@@ -146,6 +152,16 @@ typedef struct AmalgameFiber {
      *      scanning every channel). NULL when not channel-waiting. */
     int                   cancelled;
     struct AmalgameFiber** chan_wait_head;
+    /* v0.3: Async.Select multi-channel receive.
+     *   select_parked = 1 while the fiber is parked across N channels'
+     *     select_recv lists. chan_wait_head stays NULL — the waiter
+     *     nodes live on the fiber's own stack and are unlinked on
+     *     resume, so a single fiber can sit on N channels at once
+     *     (f->next can only thread one plain wait queue).
+     *   select_value caches the value pulled by the winning channel,
+     *     read back via Async.SelectValue(). */
+    int                   select_parked;
+    i64                   select_value;
     struct AmalgameFiber* next;         /* queue link */
 } AmalgameFiber;
 
@@ -162,6 +178,8 @@ typedef struct AmalgameAsyncScheduler {
     struct GC_stack_base main_sb;
     int            main_sb_captured;
     i64            next_id;
+    i64            select_rr;           /* round-robin start offset — Select fairness */
+    i64            select_value;        /* SelectValue() fallback when called from main */
     int            running;
 } AmalgameAsyncScheduler;
 
@@ -324,6 +342,8 @@ static inline AmalgameFiber* Amalgame_Async_FiberSpawn(AmalgameClosure* fn, i64 
     f->fd_wakeup_reason = 0;
     f->cancelled = 0;
     f->chan_wait_head = NULL;
+    f->select_parked = 0;
+    f->select_value = 0;
     f->next = NULL;
 
     getcontext(&f->ctx);
@@ -460,6 +480,18 @@ static inline void Amalgame_Async_FiberCancel(AmalgameFiber* f) {
         _amasync_ready_push(f);
         return;
     }
+    if (f->state == AMASYNC_WAITING && f->select_parked) {
+        /* Parked in Async.Select across N channels. The waiter nodes
+         * live on f's own stack and get unlinked by the select frame
+         * when it resumes; here we only unpark + enqueue. A sender that
+         * still sees a lingering node skips it (select_parked is 0 now),
+         * and the resumed frame observes f->cancelled and bails. */
+        f->select_parked = 0;
+        if (_amasync_sched.waiting_count > 0) _amasync_sched.waiting_count--;
+        f->state = AMASYNC_READY;
+        _amasync_ready_push(f);
+        return;
+    }
     /* AMASYNC_READY or AMASYNC_RUNNING: nothing to splice — the
      * fiber will observe the flag at its next yield point. */
 }
@@ -564,15 +596,25 @@ static inline code_bool Amalgame_Async_MakeNonBlocking(i64 fd) {
  *  Channel — scheduler-aware bounded FIFO
  * ═══════════════════════════════════════════════════════ */
 
+/* v0.3: a fiber parked in Async.Select registers one of these nodes on
+ * each watched channel's `select_recv` list. The node lives on the
+ * selecting fiber's own (GC-scanned) stack; unlike waiters_send/recv it
+ * does NOT reuse f->next, so one fiber can sit on N channels at once. */
+typedef struct AmalgameSelectWaiter {
+    AmalgameFiber*               fiber;
+    struct AmalgameSelectWaiter* chan_next;
+} AmalgameSelectWaiter;
+
 typedef struct AmalgameAsyncChannel {
-    void**           buffer;
-    i64              capacity;
-    i64              count;
-    i64              head;
-    i64              tail;
-    int              closed;
-    AmalgameFiber*   waiters_send;
-    AmalgameFiber*   waiters_recv;
+    void**                buffer;
+    i64                   capacity;
+    i64                   count;
+    i64                   head;
+    i64                   tail;
+    int                   closed;
+    AmalgameFiber*        waiters_send;
+    AmalgameFiber*        waiters_recv;
+    AmalgameSelectWaiter* select_recv;   /* v0.3: Async.Select waiters */
 } AmalgameAsyncChannel;
 
 static inline AmalgameAsyncChannel* Amalgame_Async_ChannelNew(i64 capacity) {
@@ -587,6 +629,7 @@ static inline AmalgameAsyncChannel* Amalgame_Async_ChannelNew(i64 capacity) {
     ch->closed = 0;
     ch->waiters_send = NULL;
     ch->waiters_recv = NULL;
+    ch->select_recv = NULL;
     return ch;
 }
 
@@ -598,6 +641,34 @@ static inline void _amasync_chan_wake_one(AmalgameFiber** head) {
     if (_amasync_sched.waiting_count > 0) _amasync_sched.waiting_count--;
 }
 
+/* v0.3: wake the first still-parked Select waiter on this channel.
+ * Returns 1 if one was woken. Stale nodes (whose fiber was already
+ * unparked via another channel) are skipped, not removed — the owning
+ * select frame unlinks its own nodes when it resumes. */
+static inline int _amasync_chan_wake_one_select(AmalgameAsyncChannel* ch) {
+    AmalgameSelectWaiter* w = ch->select_recv;
+    while (w) {
+        AmalgameFiber* f = w->fiber;
+        if (f && f->select_parked) {
+            f->select_parked = 0;
+            f->state = AMASYNC_READY;
+            _amasync_ready_push(f);
+            if (_amasync_sched.waiting_count > 0) _amasync_sched.waiting_count--;
+            return 1;
+        }
+        w = w->chan_next;
+    }
+    return 0;
+}
+
+/* A value just became receivable on `ch`. Hand it to a committed plain
+ * receiver if one is parked; otherwise nudge a Select waiter so it
+ * re-scans and pulls the value. One value wakes at most one consumer. */
+static inline void _amasync_chan_signal_recv(AmalgameAsyncChannel* ch) {
+    if (ch->waiters_recv) { _amasync_chan_wake_one(&ch->waiters_recv); return; }
+    _amasync_chan_wake_one_select(ch);
+}
+
 static inline code_bool Amalgame_Async_ChannelSend(AmalgameAsyncChannel* ch, i64 value) {
     if (!ch) return 0;
     while (1) {
@@ -606,7 +677,7 @@ static inline code_bool Amalgame_Async_ChannelSend(AmalgameAsyncChannel* ch, i64
             ch->buffer[ch->tail] = (void*) (intptr_t) value;
             ch->tail = (ch->tail + 1) % ch->capacity;
             ch->count++;
-            _amasync_chan_wake_one(&ch->waiters_recv);
+            _amasync_chan_signal_recv(ch);
             return 1;
         }
         /* full — park the fiber on the send queue */
@@ -634,7 +705,7 @@ static inline code_bool Amalgame_Async_ChannelTrySend(AmalgameAsyncChannel* ch, 
     ch->buffer[ch->tail] = (void*) (intptr_t) value;
     ch->tail = (ch->tail + 1) % ch->capacity;
     ch->count++;
-    _amasync_chan_wake_one(&ch->waiters_recv);
+    _amasync_chan_signal_recv(ch);
     return 1;
 }
 
@@ -678,6 +749,9 @@ static inline void Amalgame_Async_ChannelClose(AmalgameAsyncChannel* ch) {
      * receivers drain remaining buffer then return 0 sentinel. */
     while (ch->waiters_send) _amasync_chan_wake_one(&ch->waiters_send);
     while (ch->waiters_recv) _amasync_chan_wake_one(&ch->waiters_recv);
+    /* v0.3: wake every Select waiter so each re-scans and observes the
+     * closed+empty sentinel. */
+    while (_amasync_chan_wake_one_select(ch)) { }
 }
 
 static inline code_bool Amalgame_Async_ChannelIsClosed(AmalgameAsyncChannel* ch) {
@@ -690,6 +764,119 @@ static inline i64 Amalgame_Async_ChannelCount(AmalgameAsyncChannel* ch) {
 
 static inline i64 Amalgame_Async_ChannelCapacity(AmalgameAsyncChannel* ch) {
     return ch ? ch->capacity : 0;
+}
+
+/* ═══════════════════════════════════════════════════════
+ *  Select — wait for the first of N channels to be receivable
+ *  (v0.3)
+ * ═══════════════════════════════════════════════════════
+ *
+ * `Async.SelectReceive(channels)` parks the current fiber until any
+ * channel in the list has a buffered value or is closed-and-drained,
+ * then returns that channel's *index*; the received value is cached and
+ * read back with `Async.SelectValue()` (call it immediately, before any
+ * further yield/await). `SelectTryReceive` is the non-blocking form —
+ * returns the index of an already-ready channel, or -1 if none.
+ *
+ *     let i = Async.SelectReceive(channels)   // blocks
+ *     let v = Async.SelectValue()             // value from channels[i]
+ *
+ * Correctness: the fiber registers a waiter node on every channel at
+ * once; a sender wakes at most one consumer per value; on resume the
+ * fiber re-scans and pulls atomically — so no value is consumed-then-
+ * discarded (the bug that sinks the naive "spawn N racer fibers"
+ * approach). A round-robin start offset keeps it starvation-free.
+ *
+ * `channels` is a `List<Channel>`; the i64 return indexes into it. From
+ * a closed+empty channel the value is the usual 0 sentinel (check with
+ * `ch.IsClosed()` if 0 is a legal payload). Outside a fiber the call
+ * never blocks: it returns a ready index or -1.
+ */
+
+static inline i64 _amasync_select_scan(AmalgameList* channels, i64 n, i64 start) {
+    AmalgameFiber* f = _amasync_sched.current;
+    for (i64 k = 0; k < n; k++) {
+        i64 i = (start + k) % n;
+        AmalgameAsyncChannel* ch =
+            (AmalgameAsyncChannel*) AmalgameList_get(channels, (int) i);
+        if (!ch) continue;
+        if (ch->count > 0) {
+            i64 v = (i64) (intptr_t) ch->buffer[ch->head];
+            ch->head = (ch->head + 1) % ch->capacity;
+            ch->count--;
+            _amasync_chan_wake_one(&ch->waiters_send);  /* a blocked sender may proceed */
+            if (f) f->select_value = v; else _amasync_sched.select_value = v;
+            return i;
+        }
+        if (ch->closed) {
+            if (f) f->select_value = 0; else _amasync_sched.select_value = 0;
+            return i;  /* closed + empty → report it; value is the 0 sentinel */
+        }
+    }
+    return -1;
+}
+
+static inline i64 Amalgame_Async_SelectTryReceive(AmalgameList* channels) {
+    if (!channels) return -1;
+    i64 n = AmalgameList_size(channels);
+    if (n <= 0) return -1;
+    i64 start = (_amasync_sched.select_rr++) % n;
+    return _amasync_select_scan(channels, n, start);
+}
+
+static inline i64 Amalgame_Async_SelectReceive(AmalgameList* channels) {
+    if (!channels) return -1;
+    i64 n = AmalgameList_size(channels);
+    if (n <= 0) return -1;
+    AmalgameFiber* f = _amasync_sched.current;
+    while (1) {
+        i64 start = (_amasync_sched.select_rr++) % n;
+        i64 hit = _amasync_select_scan(channels, n, start);
+        if (hit >= 0) return hit;
+        if (!f) return -1;          /* not in a fiber + nothing ready: don't block */
+        if (f->cancelled) return -1;
+
+        /* Register a waiter node on every channel, then park. The node
+         * block is GC-managed and stays reachable via the channels'
+         * select_recv chains (and this frame) for the park's duration. */
+        AmalgameSelectWaiter* nodes = (AmalgameSelectWaiter*)
+            GC_MALLOC(sizeof(AmalgameSelectWaiter) * (size_t) n);
+        for (i64 i = 0; i < n; i++) {
+            AmalgameAsyncChannel* ch =
+                (AmalgameAsyncChannel*) AmalgameList_get(channels, (int) i);
+            nodes[i].fiber = f;
+            nodes[i].chan_next = NULL;
+            if (ch) {
+                nodes[i].chan_next = ch->select_recv;
+                ch->select_recv = &nodes[i];
+            }
+        }
+        f->select_parked = 1;
+        f->state = AMASYNC_WAITING;
+        _amasync_sched.waiting_count++;
+        _amasync_yield_to_main(f);
+
+        /* Resumed by a sender, a close, or a cancel. Unlink every node
+         * from its channel before re-scanning so dangling stack nodes
+         * never outlive the frame. */
+        f->select_parked = 0;
+        for (i64 i = 0; i < n; i++) {
+            AmalgameAsyncChannel* ch =
+                (AmalgameAsyncChannel*) AmalgameList_get(channels, (int) i);
+            if (!ch) continue;
+            AmalgameSelectWaiter** cur = &ch->select_recv;
+            while (*cur && *cur != &nodes[i]) cur = &(*cur)->chan_next;
+            if (*cur == &nodes[i]) *cur = nodes[i].chan_next;
+        }
+        if (f->cancelled) return -1;
+        /* loop: a channel is (probably) ready now — re-scan and pull. */
+    }
+}
+
+static inline i64 Amalgame_Async_SelectValue(void) {
+    return _amasync_sched.current
+        ? _amasync_sched.current->select_value
+        : _amasync_sched.select_value;
 }
 
 /* ═══════════════════════════════════════════════════════

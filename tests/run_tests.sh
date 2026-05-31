@@ -163,6 +163,13 @@ echo "── WithTimeout (v0.2.3) ───────────────�
 run_test "WithTimeout returns true when fast"    "[PASS] WithTimeout returns true when worker finishes early"
 run_test "WithTimeout returns false on deadline" "[PASS] WithTimeout returns false on deadline"
 
+echo "── Select (v0.3) ───────────────────────────"
+run_test "SelectReceive parks then wakes"        "[PASS] SelectReceive parks then wakes on ready channel"
+run_test "SelectReceive drains two producers"    "[PASS] SelectReceive drains two producers without loss"
+run_test "SelectReceive reports closed-empty"    "[PASS] SelectReceive reports closed-empty channel"
+run_test "SelectTryReceive non-blocking poll"    "[PASS] SelectTryReceive non-blocking poll"
+run_test "FiberCancel unparks Select-parked"     "[PASS] FiberCancel unparks a Select-parked fiber"
+
 # v0.2.1 regression: scheduler globals must be SHARED across translation
 # units. Pre-v0.2.1 used `static` linkage on `_amasync_sched`, giving
 # every .o file its own copy — a fiber spawned in one TU was invisible
