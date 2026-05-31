@@ -241,6 +241,40 @@ and returns the winner. Both fibers get cancelled at the end
 the outer's cancel propagates to the inner via `FiberCancel` and
 the inner worker observes it at its next yield point.
 
+## v0.3.0 — `Async.Select` (first-of-N channel receive)
+
+Wait on several channels at once and act on whichever becomes
+receivable first:
+
+```amalgame
+let chs = [jobs, ctrl, heartbeat]
+while (true) {
+    let i: int = Async.SelectReceive(chs)   // parks until any is ready
+    let v: int = Async.SelectValue()        // value pulled from chs[i]
+    if (i == 1) { break }                   // a control message arrived
+    handle(v)
+}
+```
+
+- **`Async.SelectReceive(channels)`** — parks the current fiber until
+  any channel in the `List<Channel>` has a buffered value or is
+  closed-and-drained; returns the winning index. Read the pulled value
+  with **`Async.SelectValue()`** immediately after (before any further
+  yield). A closed-empty channel reports its index with the usual `0`
+  sentinel.
+- **`Async.SelectTryReceive(channels)`** — non-blocking poll; returns a
+  ready channel's index or `-1`.
+
+**Why it's correct.** The naive "spawn N reader fibers racing a result
+channel" loses values — the losing readers have already `Receive`d and
+silently discard them. `SelectReceive` instead registers one waiter
+node on *every* channel at once (a per-fiber `select_parked` flag plus
+a `select_recv` list on each channel), so a sender wakes at most one
+consumer per value and the woken fiber re-scans and pulls atomically.
+A round-robin start offset keeps it starvation-free under load.
+Cancellation-aware: `FiberCancel` unparks a select-parked fiber, which
+then returns `-1`.
+
 ## v0.2.2 — cooperative cancellation
 
 `Async.FiberCancel(f)` flips a flag on the target fiber AND wakes it
@@ -309,7 +343,8 @@ any package that depends on it transitively (notably
   on Windows
 - **Timer wheel** for >1k concurrent sleepers (v0.3). Today's
   sorted-insertion sleep list is O(N) per `Sleep`
-- **`Async.Select`** multi-channel + multi-fd readiness (v0.3)
+- ~~**`Async.Select`** multi-channel readiness~~ — **shipped v0.3.0**
+  (channel-side; multi-*fd* readiness still deferred)
 - **M:N scheduling** — one scheduler per OS thread, work
   stealing, TLS for current scheduler (v0.4)
 - **`async` / `await`** language sugar in amc — a separate
