@@ -46,6 +46,14 @@
 #     ch.Close() / IsClosed()
 #     ch.Count() / Capacity()
 #
+#   ── Select (v0.3) — first-of-N receive ─────────────
+#   Async.SelectReceive(channels)   parks until any channel in the
+#                                   List<Channel> is receivable;
+#                                   returns the winning index
+#   Async.SelectValue()             value pulled by the last
+#                                   SelectReceive (read immediately)
+#   Async.SelectTryReceive(channels) non-blocking: index or -1
+#
 #   ── Scheduler ──────────────────────────────────────
 #   Scheduler.Run()               pump fibers until the ready
 #                                 queue, the sleep queue, the
@@ -101,7 +109,6 @@
 #   - Native Windows Fibers backend (ucontext is POSIX) — v0.3
 #   - Windows IOCP I/O backend — v0.3
 #   - Timer wheel for >1k concurrent timeouts (today: linear list) — v0.3
-#   - Async.Select multi-channel — v0.3
 #   - Per-fd multi-fiber wait lists (today: one waiter per fd) — v0.3
 #   - M:N scheduling (N threads × scheduler each) — v0.4
 #   - `async` / `await` language sugar in amc — separate amc work
@@ -113,7 +120,7 @@
 
 [package]
 name              = "amalgame-async"
-version           = "0.2.3"
+version           = "0.3.0"
 license           = "Apache-2.0"
 description       = "Cooperative concurrency for Amalgame — stackful coroutines, scheduler, channels. Single-threaded fiber pool on ucontext; composes with amalgame-threading for M:N parallelism."
 authors           = ["Bastien Mouget"]
@@ -159,6 +166,16 @@ ChannelClose      = { returns = "void" }
 ChannelIsClosed   = { returns = "code_bool" }
 ChannelCount      = { returns = "i64" }
 ChannelCapacity   = { returns = "i64" }
+
+# Select (v0.3) — wait for the first of N channels to be receivable.
+# SelectReceive(channels: List<Channel>) parks the fiber until any
+# channel has a value (or is closed+drained) and returns its index;
+# read the pulled value with SelectValue() right after. SelectTryReceive
+# is the non-blocking poll (index or -1). Round-robin fair, no value
+# lost (correct multi-queue registration, not the naive racer hack).
+SelectReceive     = { returns = "i64" }
+SelectTryReceive  = { returns = "i64" }
+SelectValue       = { returns = "i64" }
 
 # Scheduler
 SchedulerRun      = { returns = "void" }
