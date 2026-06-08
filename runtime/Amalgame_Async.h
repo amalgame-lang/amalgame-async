@@ -95,19 +95,67 @@
 
 #include "_runtime.h"
 
-#if !(defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__) \
-      || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__unix__))
-# error "amalgame-async v0.1 requires POSIX ucontext. Windows backend (Fibers API) is planned for v0.2."
-#endif
-
-#include <ucontext.h>
 #include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <fcntl.h>
 #include <errno.h>
-#include <unistd.h>
+
+#ifdef _WIN32
+  /* Windows backend: POSIX ucontext doesn't exist, but the Win32 Fibers
+   * API is a near-exact match (cooperative, stackful, explicit switch).
+   * We shim ucontext_t + get/make/swap/setcontext onto fibers so the
+   * scheduler below compiles and runs unchanged. WaitFd* is already a
+   * no-op stub off the epoll path (see the !AMASYNC_HAS_EPOLL branch),
+   * so no IOCP/WSAPoll loop is needed for this backend. */
+  #ifndef WIN32_LEAN_AND_MEAN
+  #  define WIN32_LEAN_AND_MEAN
+  #endif
+  #include <winsock2.h>
+  #include <windows.h>
+
+  typedef struct amasync_ucontext {
+      void* fiber;                 /* Win32 fiber handle */
+      struct { void* ss_sp; size_t ss_size; int ss_flags; } uc_stack;
+      struct amasync_ucontext* uc_link;
+      void (*_entry)(void);
+  } amasync_ucontext_t;
+  #define ucontext_t amasync_ucontext_t
+
+  static inline void* amasync_self_fiber(void) {
+      if (!IsThreadAFiber()) return ConvertThreadToFiber(NULL);
+      return GetCurrentFiber();
+  }
+  static inline int amasync_getcontext(ucontext_t* c) {
+      memset(c, 0, sizeof(*c));
+      return 0;
+  }
+  static void __stdcall amasync_fiber_trampoline(void* p) {
+      ((ucontext_t*) p)->_entry();
+  }
+  static inline void amasync_makecontext(ucontext_t* c, void (*fn)(void), int argc) {
+      (void) argc;
+      c->_entry = fn;
+      size_t sz = c->uc_stack.ss_size ? c->uc_stack.ss_size : (size_t)(64 * 1024);
+      c->fiber  = CreateFiber(sz, amasync_fiber_trampoline, c);
+  }
+  static inline int amasync_swapcontext(ucontext_t* from, ucontext_t* to) {
+      from->fiber = amasync_self_fiber();
+      SwitchToFiber(to->fiber);
+      return 0;
+  }
+  static inline void amasync_setcontext(ucontext_t* to) {
+      SwitchToFiber(to->fiber);
+  }
+  #define getcontext(c)        amasync_getcontext(c)
+  #define makecontext(c,fn,n)  amasync_makecontext((c),(fn),(n))
+  #define swapcontext(f,t)     amasync_swapcontext((f),(t))
+  #define setcontext(t)        amasync_setcontext(t)
+#else
+  #include <ucontext.h>
+  #include <fcntl.h>
+  #include <unistd.h>
+#endif
 
 #ifdef __linux__
 # include <sys/epoll.h>
@@ -586,10 +634,18 @@ static inline code_bool Amalgame_Async_WaitFdWritable(i64 fd, i64 timeout_ms) {
 #endif /* AMASYNC_HAS_EPOLL */
 
 static inline code_bool Amalgame_Async_MakeNonBlocking(i64 fd) {
+#ifdef _WIN32
+    /* Winsock non-blocking switch — there's no fcntl on Windows, and
+     * the fds the async layer parks on are sockets. */
+    u_long mode = 1;
+    if (ioctlsocket((SOCKET) fd, FIONBIO, &mode) != 0) return 0;
+    return 1;
+#else
     int flags = fcntl((int) fd, F_GETFL, 0);
     if (flags < 0) return 0;
     if (fcntl((int) fd, F_SETFL, flags | O_NONBLOCK) < 0) return 0;
     return 1;
+#endif
 }
 
 /* ═══════════════════════════════════════════════════════
