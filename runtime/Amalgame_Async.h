@@ -874,7 +874,7 @@ static inline i64 _amasync_select_scan(AmalgameList* channels, i64 n, i64 start)
 
 static inline i64 Amalgame_Async_SelectTryReceive(AmalgameList* channels) {
     if (!channels) return -1;
-    i64 n = AmalgameList_size(channels);
+    i64 n = AmalgameList_count(channels);
     if (n <= 0) return -1;
     i64 start = (_amasync_sched.select_rr++) % n;
     return _amasync_select_scan(channels, n, start);
@@ -882,7 +882,7 @@ static inline i64 Amalgame_Async_SelectTryReceive(AmalgameList* channels) {
 
 static inline i64 Amalgame_Async_SelectReceive(AmalgameList* channels) {
     if (!channels) return -1;
-    i64 n = AmalgameList_size(channels);
+    i64 n = AmalgameList_count(channels);
     if (n <= 0) return -1;
     AmalgameFiber* f = _amasync_sched.current;
     while (1) {
