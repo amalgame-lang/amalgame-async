@@ -233,6 +233,43 @@ CEOF
     fi
 fi
 
+# ── Async.Select link path ────────────────────────────────────────
+# Regression guard. SelectTryReceive/SelectReceive called
+# AmalgameList_size, which does not exist in the runtime (it is
+# AmalgameList_count). Both are `static inline`, so an unused header
+# compiles happily on an implicit declaration — nothing failed until
+# someone actually CALLED Select, and then it failed at LINK, not at
+# compile. No test linked Select, so the whole feature shipped broken
+# from v0.3.0. Merely referencing the symbols is enough to catch it.
+echo -e "\n── Async.Select link path ──"
+cat > "$BUILD_DIR/_select_link.c" <<'CEOF'
+#include "Amalgame_Async.h"
+#include <stdio.h>
+int main(void) {
+    GC_INIT();
+    AmalgameList* l = AmalgameList_new();
+    /* Empty list → -1 from both entry points; the point is that they
+     * link at all. */
+    long long a = (long long) Amalgame_Async_SelectTryReceive(l);
+    long long b = (long long) Amalgame_Async_SelectReceive(l);
+    printf("select_try=%lld select_recv=%lld\n", a, b);
+    return (a == -1 && b == -1) ? 0 : 1;
+}
+CEOF
+gcc -O2 -I"$AMC_RUNTIME" -I"$PKG_RUNTIME" "$BUILD_DIR/_select_link.c" \
+    -lgc -lpthread -o "$BUILD_DIR/_select_link" 2>"$BUILD_DIR/_select_link.log"
+if [ ! -x "$BUILD_DIR/_select_link" ]; then
+    echo -e "${RED}FAIL${NC} (Select does not link)"
+    head -5 "$BUILD_DIR/_select_link.log" | sed 's/^/    /'
+    FAIL=$((FAIL + 1))
+elif SEL_OUT=$("$BUILD_DIR/_select_link"); then
+    echo -e "${GREEN}PASS${NC} (Select links and runs: $SEL_OUT)"
+    PASS=$((PASS + 1))
+else
+    echo -e "${RED}FAIL${NC} (Select linked but returned wrong values: $SEL_OUT)"
+    FAIL=$((FAIL + 1))
+fi
+
 echo ""
 echo "────────────────────────────────────────────"
 echo -e "  ${GREEN}PASS: $PASS${NC}  |  ${RED}FAIL: $FAIL${NC}  |  ${YELLOW}SKIP: $SKIP${NC}"
