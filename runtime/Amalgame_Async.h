@@ -152,6 +152,14 @@
   #define swapcontext(f,t)     amasync_swapcontext((f),(t))
   #define setcontext(t)        amasync_setcontext(t)
 #else
+  /* macOS <ucontext.h> hides the ucontext routines behind _XOPEN_SOURCE /
+   * _DARWIN_C_SOURCE and #errors when neither is set. Darwin's default C
+   * level is already FULL, so defining _DARWIN_C_SOURCE right before the
+   * include (order-independent — checked at ucontext.h include time) just
+   * opts the routines back in without restricting other features. */
+  #if defined(__APPLE__) && !defined(_XOPEN_SOURCE) && !defined(_DARWIN_C_SOURCE)
+  #  define _DARWIN_C_SOURCE 1
+  #endif
   #include <ucontext.h>
   #include <fcntl.h>
   #include <unistd.h>
